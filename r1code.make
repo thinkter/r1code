@@ -28,7 +28,7 @@ ifeq ($(origin AR), default)
   AR = ar
 endif
 RESCOMP = windres
-INCLUDES += -Isrc -Iinclude -Ibuild/external/raylib-master/src
+INCLUDES += -Isrc -Iinclude -Iexternal/raygui -Ibuild/external/raylib-master/src
 FORCE_INCLUDE +=
 ALL_CPPFLAGS += $(CPPFLAGS) -MD -MP $(DEFINES) $(INCLUDES)
 ALL_RESFLAGS += $(RESFLAGS) $(DEFINES) $(INCLUDES)
@@ -118,8 +118,20 @@ endif
 GENERATED :=
 OBJECTS :=
 
+GENERATED += $(OBJDIR)/app_ui.o
+GENERATED += $(OBJDIR)/codex_rpc.o
 GENERATED += $(OBJDIR)/main.o
+GENERATED += $(OBJDIR)/platform_dialogs.o
+GENERATED += $(OBJDIR)/raygui_impl.o
+GENERATED += $(OBJDIR)/text_panel.o
+GENERATED += $(OBJDIR)/ui_theme.o
+OBJECTS += $(OBJDIR)/app_ui.o
+OBJECTS += $(OBJDIR)/codex_rpc.o
 OBJECTS += $(OBJDIR)/main.o
+OBJECTS += $(OBJDIR)/platform_dialogs.o
+OBJECTS += $(OBJDIR)/raygui_impl.o
+OBJECTS += $(OBJDIR)/text_panel.o
+OBJECTS += $(OBJDIR)/ui_theme.o
 
 # Rules
 # #############################################
@@ -183,7 +195,25 @@ endif
 # File Rules
 # #############################################
 
+$(OBJDIR)/app_ui.o: src/app_ui.c
+	@echo "$(notdir $<)"
+	$(SILENT) $(CC) $(ALL_CFLAGS) $(FORCE_INCLUDE) -o "$@" -MF "$(@:%.o=%.d)" -c "$<"
+$(OBJDIR)/codex_rpc.o: src/codex_rpc.c
+	@echo "$(notdir $<)"
+	$(SILENT) $(CC) $(ALL_CFLAGS) $(FORCE_INCLUDE) -o "$@" -MF "$(@:%.o=%.d)" -c "$<"
 $(OBJDIR)/main.o: src/main.c
+	@echo "$(notdir $<)"
+	$(SILENT) $(CC) $(ALL_CFLAGS) $(FORCE_INCLUDE) -o "$@" -MF "$(@:%.o=%.d)" -c "$<"
+$(OBJDIR)/platform_dialogs.o: src/platform_dialogs.c
+	@echo "$(notdir $<)"
+	$(SILENT) $(CC) $(ALL_CFLAGS) $(FORCE_INCLUDE) -o "$@" -MF "$(@:%.o=%.d)" -c "$<"
+$(OBJDIR)/raygui_impl.o: src/raygui_impl.c
+	@echo "$(notdir $<)"
+	$(SILENT) $(CC) $(ALL_CFLAGS) $(FORCE_INCLUDE) -o "$@" -MF "$(@:%.o=%.d)" -c "$<"
+$(OBJDIR)/text_panel.o: src/text_panel.c
+	@echo "$(notdir $<)"
+	$(SILENT) $(CC) $(ALL_CFLAGS) $(FORCE_INCLUDE) -o "$@" -MF "$(@:%.o=%.d)" -c "$<"
+$(OBJDIR)/ui_theme.o: src/ui_theme.c
 	@echo "$(notdir $<)"
 	$(SILENT) $(CC) $(ALL_CFLAGS) $(FORCE_INCLUDE) -o "$@" -MF "$(@:%.o=%.d)" -c "$<"
 

@@ -3,6 +3,7 @@ CompileFlags:
   Add:
     - -Iinclude
     - -Isrc
+    - -Iexternal/raygui
     - -Iexternal/raylib-master/src
     - -Ibuild/external/raylib-master/src
     - -DPLATFORM_DESKTOP
