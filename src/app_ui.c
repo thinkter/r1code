@@ -8,11 +8,137 @@
 #include "text_panel.h"
 #include "ui_theme.h"
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 #define UI_LOG_FONT_SIZE 16.0f
+
+typedef struct FolderPickerTask {
+    pthread_t thread;
+    atomic_bool active;
+    atomic_bool done;
+    bool success;
+    char start_dir[512];
+    char selected_dir[512];
+} FolderPickerTask;
+
+static bool SubmitPrompt(CodexRpcClient *client, char *prompt, bool *prompt_edit_mode)
+{
+    if (!CodexRpcClient_SendPrompt(client, prompt)) {
+        return false;
+    }
+
+    prompt[0] = '\0';
+    *prompt_edit_mode = false;
+    return true;
+}
+
+static void *FolderPickerThreadMain(void *userdata)
+{
+    FolderPickerTask *task = (FolderPickerTask *)userdata;
+
+    task->success = OpenNativeFolderPicker(task->start_dir, task->selected_dir, sizeof(task->selected_dir));
+    atomic_store_explicit(&task->done, true, memory_order_release);
+    return NULL;
+}
+
+static bool StartFolderPickerTask(FolderPickerTask *task, const char *cwd)
+{
+    if (atomic_load_explicit(&task->active, memory_order_acquire)) {
+        return false;
+    }
+
+    snprintf(task->start_dir, sizeof(task->start_dir), "%s", cwd);
+    task->selected_dir[0] = '\0';
+    task->success = false;
+    atomic_store_explicit(&task->done, false, memory_order_relaxed);
+
+    if (pthread_create(&task->thread, NULL, FolderPickerThreadMain, task) != 0) {
+        return false;
+    }
+
+    atomic_store_explicit(&task->active, true, memory_order_release);
+    return true;
+}
+
+static bool PollFolderPickerTask(FolderPickerTask *task)
+{
+    if (!atomic_load_explicit(&task->active, memory_order_acquire)) {
+        return false;
+    }
+
+    if (!atomic_load_explicit(&task->done, memory_order_acquire)) {
+        return false;
+    }
+
+    pthread_join(task->thread, NULL);
+    atomic_store_explicit(&task->active, false, memory_order_release);
+    return true;
+}
+
+static void JoinFolderPickerTaskIfActive(FolderPickerTask *task)
+{
+    if (!atomic_load_explicit(&task->active, memory_order_acquire)) {
+        return;
+    }
+
+    pthread_join(task->thread, NULL);
+    atomic_store_explicit(&task->active, false, memory_order_release);
+}
+
+static uint32_t HashLogLines(const CodexRpcClient *client)
+{
+    uint32_t hash = 2166136261u;
+
+    for (int i = 0; i < client->log_line_count; ++i) {
+        const char *line = client->log_lines[i];
+        for (size_t j = 0; line[j] != '\0'; ++j) {
+            hash ^= (uint32_t)(unsigned char)line[j];
+            hash *= 16777619u;
+        }
+        hash ^= (uint32_t)'\n';
+        hash *= 16777619u;
+    }
+
+    return hash ^ (uint32_t)client->log_line_count;
+}
+
+static void BuildJoinedLogs(const CodexRpcClient *client, char *output, size_t output_size)
+{
+    size_t out = 0;
+
+    if (output_size == 0) {
+        return;
+    }
+
+    if (client->log_line_count <= 0) {
+        snprintf(output, output_size, "%s", "No transport log yet.");
+        return;
+    }
+
+    output[0] = '\0';
+    for (int i = 0; i < client->log_line_count && out + 1 < output_size; ++i) {
+        const char *line = client->log_lines[i];
+        size_t line_length = strlen(line);
+        size_t writable = output_size - out - 1;
+
+        if (line_length > writable) {
+            line_length = writable;
+        }
+        memcpy(output + out, line, line_length);
+        out += line_length;
+
+        if ((i + 1) < client->log_line_count && out + 1 < output_size) {
+            output[out++] = '\n';
+        }
+    }
+
+    output[out] = '\0';
+}
 
 int RunApplication(void)
 {
@@ -22,6 +148,10 @@ int RunApplication(void)
     bool prompt_edit_mode = false;
     Vector2 transcript_scroll = {0};
     Vector2 log_scroll = {0};
+    FolderPickerTask folder_picker_task = {0};
+    char joined_logs_cache[CODEX_RPC_MAX_LOG_LINES * CODEX_RPC_MAX_LOG_LINE] = "No transport log yet.";
+    uint32_t last_log_hash = 0;
+    int last_log_count = -1;
 
     SetConfigFlags(FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI | FLAG_WINDOW_RESIZABLE);
     InitWindow(1440, 900, "Codex RPC Wrapper");
@@ -105,11 +235,10 @@ int RunApplication(void)
             bool ctrl_down = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
             if (prompt_edit_mode && IsKeyPressed(KEY_ESCAPE)) prompt_edit_mode = false;
             if (prompt_edit_mode && ctrl_down && IsKeyPressed(KEY_ENTER)) {
-                CodexRpcClient_SendPrompt(&client, prompt);
-                prompt_edit_mode = false;
+                SubmitPrompt(&client, prompt, &prompt_edit_mode);
             }
             if (!prompt_edit_mode && IsKeyPressed(KEY_ENTER)) {
-                CodexRpcClient_SendPrompt(&client, prompt);
+                SubmitPrompt(&client, prompt, &prompt_edit_mode);
             }
 
             if (IsKeyPressed(KEY_R)) {
@@ -120,6 +249,15 @@ int RunApplication(void)
 
         CodexRpcClient_Update(&client);
 
+        if (PollFolderPickerTask(&folder_picker_task)) {
+            if (folder_picker_task.success) {
+                snprintf(client.cwd, sizeof(client.cwd), "%s", folder_picker_task.selected_dir);
+                snprintf(client.status, sizeof(client.status), "Working folder updated");
+            } else {
+                snprintf(client.last_error, sizeof(client.last_error), "%s", "No native folder picker was available or the dialog was cancelled");
+            }
+        }
+
         BeginDrawing();
         ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
 
@@ -127,14 +265,11 @@ int RunApplication(void)
         GuiLabel(header_title, "Codex CLI App Server Wrapper");
         GuiLabel(header_status, client.status);
         if (GuiButton(folder_button, "Choose Folder")) {
-            char selected_dir[512];
-
             prompt_edit_mode = false;
-            if (OpenNativeFolderPicker(client.cwd, selected_dir, sizeof(selected_dir))) {
-                snprintf(client.cwd, sizeof(client.cwd), "%s", selected_dir);
-                snprintf(client.status, sizeof(client.status), "Working folder updated");
+            if (StartFolderPickerTask(&folder_picker_task, client.cwd)) {
+                snprintf(client.status, sizeof(client.status), "Opening folder picker...");
             } else {
-                snprintf(client.last_error, sizeof(client.last_error), "%s", "No native folder picker was available or the dialog was cancelled");
+                snprintf(client.last_error, sizeof(client.last_error), "%s", "Folder picker already running or failed to start");
             }
         }
 
@@ -167,42 +302,37 @@ int RunApplication(void)
         GuiPanel(prompt_box, "Prompt");
         GuiLabel(prompt_hint, prompt_edit_mode ? "Press Enter to commit, Esc to stop editing" : "Click the textbox to edit the next prompt");
         if (GuiButton(send_button, "Send")) {
-            CodexRpcClient_SendPrompt(&client, prompt);
-            prompt_edit_mode = false;
+            SubmitPrompt(&client, prompt, &prompt_edit_mode);
         }
-        GuiSetStyle(TEXTBOX, BASE_COLOR_NORMAL, ColorToInt((Color){30, 35, 45, 255}));
-        GuiSetStyle(TEXTBOX, BASE_COLOR_FOCUSED, ColorToInt((Color){44, 54, 72, 255}));
-        GuiSetStyle(TEXTBOX, BASE_COLOR_PRESSED, ColorToInt((Color){44, 54, 72, 255}));
-        GuiSetStyle(TEXTBOX, BORDER_COLOR_NORMAL, ColorToInt((Color){70, 84, 104, 255}));
-        GuiSetStyle(TEXTBOX, BORDER_COLOR_FOCUSED, ColorToInt((Color){130, 198, 255, 255}));
-        GuiSetStyle(TEXTBOX, BORDER_COLOR_PRESSED, ColorToInt((Color){130, 198, 255, 255}));
-        GuiSetStyle(TEXTBOX, TEXT_COLOR_NORMAL, ColorToInt((Color){220, 226, 235, 255}));
-        GuiSetStyle(TEXTBOX, TEXT_COLOR_FOCUSED, ColorToInt((Color){220, 226, 235, 255}));
-        GuiSetStyle(TEXTBOX, TEXT_COLOR_PRESSED, ColorToInt((Color){220, 226, 235, 255}));
+        GuiSetStyle(TEXTBOX, BASE_COLOR_NORMAL, ColorToInt((Color){6, 6, 6, 255}));
+        GuiSetStyle(TEXTBOX, BASE_COLOR_FOCUSED, ColorToInt((Color){12, 12, 12, 255}));
+        GuiSetStyle(TEXTBOX, BASE_COLOR_PRESSED, ColorToInt((Color){18, 18, 18, 255}));
+        GuiSetStyle(TEXTBOX, BORDER_COLOR_NORMAL, ColorToInt((Color){40, 40, 40, 255}));
+        GuiSetStyle(TEXTBOX, BORDER_COLOR_FOCUSED, ColorToInt((Color){74, 74, 74, 255}));
+        GuiSetStyle(TEXTBOX, BORDER_COLOR_PRESSED, ColorToInt((Color){96, 96, 96, 255}));
+        GuiSetStyle(TEXTBOX, TEXT_COLOR_NORMAL, ColorToInt((Color){235, 235, 235, 255}));
+        GuiSetStyle(TEXTBOX, TEXT_COLOR_FOCUSED, ColorToInt((Color){235, 235, 235, 255}));
+        GuiSetStyle(TEXTBOX, TEXT_COLOR_PRESSED, ColorToInt((Color){255, 255, 255, 255}));
         if (GuiTextBox(prompt_input, prompt, CODEX_RPC_MAX_PROMPT, prompt_edit_mode)) {
             if (prompt_edit_mode) {
-                if (IsKeyPressed(KEY_ENTER)) CodexRpcClient_SendPrompt(&client, prompt);
-                prompt_edit_mode = false;
+                if (IsKeyPressed(KEY_ENTER)) {
+                    SubmitPrompt(&client, prompt, &prompt_edit_mode);
+                } else {
+                    prompt_edit_mode = false;
+                }
             } else {
                 prompt_edit_mode = true;
             }
         }
 
         {
-            char joined_logs[CODEX_RPC_MAX_LOG_LINES * CODEX_RPC_MAX_LOG_LINE] = {0};
-
-            if (client.log_line_count <= 0) {
-                snprintf(joined_logs, sizeof(joined_logs), "%s", "No transport log yet.");
-            } else {
-                for (int i = 0; i < client.log_line_count; ++i) {
-                    strncat(joined_logs, client.log_lines[i], sizeof(joined_logs) - strlen(joined_logs) - 1);
-                    if (i + 1 < client.log_line_count) {
-                        strncat(joined_logs, "\n", sizeof(joined_logs) - strlen(joined_logs) - 1);
-                    }
-                }
+            uint32_t current_log_hash = HashLogLines(&client);
+            if (client.log_line_count != last_log_count || current_log_hash != last_log_hash) {
+                BuildJoinedLogs(&client, joined_logs_cache, sizeof(joined_logs_cache));
+                last_log_hash = current_log_hash;
+                last_log_count = client.log_line_count;
             }
-
-            DrawScrollTextPanel(ui_font, log_panel, "Transport Log", joined_logs, UI_LOG_FONT_SIZE, &log_scroll, log_height - 12);
+            DrawScrollTextPanel(ui_font, log_panel, "Transport Log", joined_logs_cache, UI_LOG_FONT_SIZE, &log_scroll, log_height - 12);
         }
 
         GuiStatusBar(
@@ -214,6 +344,7 @@ int RunApplication(void)
     }
 
     CodexRpcClient_Stop(&client);
+    JoinFolderPickerTaskIfActive(&folder_picker_task);
     if (ui_font.texture.id != 0 && ui_font.texture.id != GetFontDefault().texture.id) {
         UnloadFont(ui_font);
     }

@@ -34,8 +34,10 @@ typedef struct CodexRpcClient {
 
     char stdout_buffer[8192];
     size_t stdout_buffer_len;
+    bool stdout_discarding_oversize_line;
     char stderr_buffer[4096];
     size_t stderr_buffer_len;
+    bool stderr_discarding_oversize_line;
 
     char log_lines[CODEX_RPC_MAX_LOG_LINES][CODEX_RPC_MAX_LOG_LINE];
     int log_line_count;
@@ -46,4 +48,3 @@ bool CodexRpcClient_Start(CodexRpcClient *client);
 void CodexRpcClient_Update(CodexRpcClient *client);
 void CodexRpcClient_Stop(CodexRpcClient *client);
 bool CodexRpcClient_SendPrompt(CodexRpcClient *client, const char *prompt);
-

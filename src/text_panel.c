@@ -3,6 +3,7 @@
 #include "raygui.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
 #define UI_FONT_SPACING 0.0f
@@ -13,6 +14,17 @@ typedef struct WrappedLineInfo {
     int next_start;
     bool ended_on_newline;
 } WrappedLineInfo;
+
+typedef struct WrapMetricsCacheEntry {
+    bool used;
+    uint32_t key_hash;
+    uint32_t text_hash;
+    float width;
+    float font_size;
+    int line_count;
+} WrapMetricsCacheEntry;
+
+static WrapMetricsCacheEntry g_wrap_cache[4] = {0};
 
 static float MeasureUiTextWidth(Font font, const char *text, float font_size)
 {
@@ -100,6 +112,48 @@ static int CountWrappedLines(Font font, const char *text, float max_width, float
     return line_count > 0 ? line_count : 1;
 }
 
+static uint32_t HashText(const char *text)
+{
+    uint32_t hash = 2166136261u;
+
+    if (text == NULL) {
+        return hash;
+    }
+
+    for (size_t i = 0; text[i] != '\0'; ++i) {
+        hash ^= (uint32_t)(unsigned char)text[i];
+        hash *= 16777619u;
+    }
+
+    return hash;
+}
+
+static int GetCachedLineCount(Font font, const char *title, const char *text, float max_width, float font_size)
+{
+    uint32_t key_hash = HashText(title);
+    uint32_t text_hash = HashText(text);
+    size_t slot = (size_t)(key_hash % (uint32_t)(sizeof(g_wrap_cache) / sizeof(g_wrap_cache[0])));
+    WrapMetricsCacheEntry *entry = &g_wrap_cache[slot];
+
+    if (
+        entry->used &&
+        entry->key_hash == key_hash &&
+        entry->text_hash == text_hash &&
+        entry->width == max_width &&
+        entry->font_size == font_size
+    ) {
+        return entry->line_count;
+    }
+
+    entry->used = true;
+    entry->key_hash = key_hash;
+    entry->text_hash = text_hash;
+    entry->width = max_width;
+    entry->font_size = font_size;
+    entry->line_count = CountWrappedLines(font, text, max_width, font_size);
+    return entry->line_count;
+}
+
 void DrawScrollTextPanel(
     Font font,
     Rectangle bounds,
@@ -127,7 +181,7 @@ void DrawScrollTextPanel(
     GuiSetStyle(DEFAULT, TEXT_SIZE, (int)font_size);
     GuiSetStyle(DEFAULT, TEXT_SPACING, 1);
 
-    line_count = CountWrappedLines(font, display_text, bounds.width - 44.0f, font_size);
+    line_count = GetCachedLineCount(font, title, display_text, bounds.width - 44.0f, font_size);
     content_height = (int)(line_count * line_height) + 20;
     if (content_height < min_content_height) {
         content_height = min_content_height;

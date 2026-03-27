@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -65,16 +66,35 @@ static bool CodexRpcClient_SetNonBlocking(int fd)
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
-static void JsonEscape(const char *input, char *output, size_t output_size)
+static bool JsonEscape(const char *input, char *output, size_t output_size)
 {
     size_t out = 0;
 
     if (output_size == 0) {
-        return;
+        return false;
     }
 
-    for (size_t i = 0; input[i] != '\0' && out + 2 < output_size; ++i) {
+    for (size_t i = 0; input[i] != '\0'; ++i) {
         unsigned char ch = (unsigned char)input[i];
+        size_t needed = 0;
+
+        switch (ch) {
+            case '\\':
+            case '"':
+            case '\n':
+            case '\r':
+            case '\t':
+                needed = 2;
+                break;
+            default:
+                needed = (ch >= 32) ? 1 : 0;
+                break;
+        }
+
+        if (out + needed >= output_size) {
+            output[out] = '\0';
+            return false;
+        }
 
         switch (ch) {
             case '\\':
@@ -103,6 +123,7 @@ static void JsonEscape(const char *input, char *output, size_t output_size)
     }
 
     output[out] = '\0';
+    return true;
 }
 
 static bool JsonExtractString(const char *json, const char *key, char *output, size_t output_size)
@@ -195,6 +216,72 @@ static void TranscriptAppend(CodexRpcClient *client, const char *text)
     strncat(client->transcript, text, available);
 }
 
+static void TranscriptAppendTurnEnvelope(CodexRpcClient *client, const char *prompt)
+{
+    if (client->transcript[0] != '\0') {
+        TranscriptAppend(client, "\n\n");
+    }
+
+    TranscriptAppend(client, "You: ");
+    TranscriptAppend(client, prompt);
+    TranscriptAppend(client, "\nCodex: ");
+}
+
+static void CodexRpcClient_CloseFds(CodexRpcClient *client)
+{
+    if (client->stdin_fd >= 0) {
+        close(client->stdin_fd);
+        client->stdin_fd = -1;
+    }
+
+    if (client->stdout_fd >= 0) {
+        close(client->stdout_fd);
+        client->stdout_fd = -1;
+    }
+
+    if (client->stderr_fd >= 0) {
+        close(client->stderr_fd);
+        client->stderr_fd = -1;
+    }
+}
+
+static void CodexRpcClient_ResetRuntimeState(CodexRpcClient *client)
+{
+    client->running = false;
+    client->initialized = false;
+    client->thread_ready = false;
+    client->turn_in_flight = false;
+    client->pid = -1;
+}
+
+static void ClosePipePair(int pipefd[2])
+{
+    if (pipefd[0] >= 0) {
+        close(pipefd[0]);
+        pipefd[0] = -1;
+    }
+
+    if (pipefd[1] >= 0) {
+        close(pipefd[1]);
+        pipefd[1] = -1;
+    }
+}
+
+static void CodexRpcClient_MarkOversizeLineDiscard(
+    CodexRpcClient *client,
+    bool is_stderr,
+    size_t *buffer_len,
+    bool *discarding_oversize_line
+)
+{
+    CodexRpcClient_AddLogLine(
+        client,
+        is_stderr ? "[stderr] dropping oversized line until newline" : "[stdout] dropping oversized line until newline"
+    );
+    *discarding_oversize_line = true;
+    *buffer_len = 0;
+}
+
 static bool CodexRpcClient_SendRaw(CodexRpcClient *client, const char *line)
 {
     size_t length = strlen(line);
@@ -273,7 +360,10 @@ static bool CodexRpcClient_SendThreadStart(CodexRpcClient *client)
     char payload[2048];
     int request_id = client->next_request_id++;
 
-    JsonEscape(client->cwd, escaped_cwd, sizeof(escaped_cwd));
+    if (!JsonEscape(client->cwd, escaped_cwd, sizeof(escaped_cwd))) {
+        CodexRpcClient_SetError(client, "cwd is too long to encode");
+        return false;
+    }
     client->thread_start_request_id = request_id;
 
     snprintf(
@@ -290,7 +380,7 @@ static bool CodexRpcClient_SendThreadStart(CodexRpcClient *client)
 
 bool CodexRpcClient_SendPrompt(CodexRpcClient *client, const char *prompt)
 {
-    char escaped_prompt[(CODEX_RPC_MAX_PROMPT * 2)];
+    char escaped_prompt[(CODEX_RPC_MAX_PROMPT * 6)];
     char escaped_cwd[1024];
     char payload[4096];
     int request_id = 0;
@@ -299,13 +389,18 @@ bool CodexRpcClient_SendPrompt(CodexRpcClient *client, const char *prompt)
         return false;
     }
 
-    JsonEscape(prompt, escaped_prompt, sizeof(escaped_prompt));
-    JsonEscape(client->cwd, escaped_cwd, sizeof(escaped_cwd));
+    if (!JsonEscape(prompt, escaped_prompt, sizeof(escaped_prompt))) {
+        CodexRpcClient_SetError(client, "prompt is too long to encode");
+        return false;
+    }
+    if (!JsonEscape(client->cwd, escaped_cwd, sizeof(escaped_cwd))) {
+        CodexRpcClient_SetError(client, "cwd is too long to encode");
+        return false;
+    }
 
     request_id = client->next_request_id++;
     client->turn_start_request_id = request_id;
     client->turn_in_flight = true;
-    client->transcript[0] = '\0';
 
     snprintf(
         payload,
@@ -322,6 +417,8 @@ bool CodexRpcClient_SendPrompt(CodexRpcClient *client, const char *prompt)
         client->turn_in_flight = false;
         return false;
     }
+
+    TranscriptAppendTurnEnvelope(client, prompt);
 
     return true;
 }
@@ -449,17 +546,33 @@ static void CodexRpcClient_ProcessBuffer(
     size_t *buffer_len,
     size_t buffer_size,
     ssize_t bytes_read,
-    bool is_stderr
+    bool is_stderr,
+    bool *discarding_oversize_line
 )
 {
     size_t start = 0;
 
     if ((size_t)bytes_read + *buffer_len >= buffer_size) {
-        *buffer_len = 0;
+        CodexRpcClient_MarkOversizeLineDiscard(client, is_stderr, buffer_len, discarding_oversize_line);
+        return;
     }
 
     *buffer_len += (size_t)bytes_read;
     buffer[*buffer_len] = '\0';
+
+    if (*discarding_oversize_line) {
+        char *newline = memchr(buffer, '\n', *buffer_len);
+
+        if (newline == NULL) {
+            if (*buffer_len >= buffer_size - 1) {
+                *buffer_len = 0;
+            }
+            return;
+        }
+
+        start = (size_t)((newline - buffer) + 1);
+        *discarding_oversize_line = false;
+    }
 
     for (size_t i = 0; i < *buffer_len; ++i) {
         if (buffer[i] != '\n') {
@@ -488,13 +601,13 @@ static void CodexRpcClient_DrainFd(
     char *buffer,
     size_t *buffer_len,
     size_t buffer_size,
-    bool is_stderr
+    bool is_stderr,
+    bool *discarding_oversize_line
 )
 {
     while (true) {
         if (*buffer_len >= buffer_size - 1) {
-            *buffer_len = 0;
-            buffer[0] = '\0';
+            CodexRpcClient_MarkOversizeLineDiscard(client, is_stderr, buffer_len, discarding_oversize_line);
         }
 
         ssize_t bytes_read = read(fd, buffer + *buffer_len, buffer_size - *buffer_len - 1);
@@ -511,7 +624,7 @@ static void CodexRpcClient_DrainFd(
             return;
         }
 
-        CodexRpcClient_ProcessBuffer(client, buffer, buffer_len, buffer_size, bytes_read, is_stderr);
+        CodexRpcClient_ProcessBuffer(client, buffer, buffer_len, buffer_size, bytes_read, is_stderr, discarding_oversize_line);
     }
 }
 
@@ -531,22 +644,31 @@ void CodexRpcClient_Init(CodexRpcClient *client, const char *cwd)
 
 bool CodexRpcClient_Start(CodexRpcClient *client)
 {
-    int stdin_pipe[2];
-    int stdout_pipe[2];
-    int stderr_pipe[2];
+    int stdin_pipe[2] = {-1, -1};
+    int stdout_pipe[2] = {-1, -1};
+    int stderr_pipe[2] = {-1, -1};
     pid_t child_pid = 0;
 
     if (client->running) {
         return true;
     }
 
+    CodexRpcClient_CloseFds(client);
+    CodexRpcClient_ResetRuntimeState(client);
+
     if (pipe(stdin_pipe) != 0 || pipe(stdout_pipe) != 0 || pipe(stderr_pipe) != 0) {
+        ClosePipePair(stdin_pipe);
+        ClosePipePair(stdout_pipe);
+        ClosePipePair(stderr_pipe);
         CodexRpcClient_SetError(client, "pipe failed: %s", strerror(errno));
         return false;
     }
 
     child_pid = fork();
     if (child_pid < 0) {
+        ClosePipePair(stdin_pipe);
+        ClosePipePair(stdout_pipe);
+        ClosePipePair(stderr_pipe);
         CodexRpcClient_SetError(client, "fork failed: %s", strerror(errno));
         return false;
     }
@@ -587,14 +709,21 @@ bool CodexRpcClient_Start(CodexRpcClient *client)
     client->thread_start_request_id = 0;
     client->turn_start_request_id = 0;
     client->stdout_buffer_len = 0;
+    client->stdout_discarding_oversize_line = false;
     client->stderr_buffer_len = 0;
+    client->stderr_discarding_oversize_line = false;
     client->log_line_count = 0;
 
     if (!CodexRpcClient_SetNonBlocking(client->stdout_fd) || !CodexRpcClient_SetNonBlocking(client->stderr_fd)) {
         CodexRpcClient_SetError(client, "failed to set non-blocking pipes");
     }
 
-    return CodexRpcClient_SendInitialize(client);
+    if (!CodexRpcClient_SendInitialize(client)) {
+        CodexRpcClient_Stop(client);
+        return false;
+    }
+
+    return true;
 }
 
 void CodexRpcClient_Update(CodexRpcClient *client)
@@ -612,7 +741,8 @@ void CodexRpcClient_Update(CodexRpcClient *client)
         client->stdout_buffer,
         &client->stdout_buffer_len,
         sizeof(client->stdout_buffer),
-        false
+        false,
+        &client->stdout_discarding_oversize_line
     );
 
     CodexRpcClient_DrainFd(
@@ -621,41 +751,45 @@ void CodexRpcClient_Update(CodexRpcClient *client)
         client->stderr_buffer,
         &client->stderr_buffer_len,
         sizeof(client->stderr_buffer),
-        true
+        true,
+        &client->stderr_discarding_oversize_line
     );
 
     result = waitpid((pid_t)client->pid, &status, WNOHANG);
     if (result == (pid_t)client->pid) {
-        client->running = false;
+        CodexRpcClient_CloseFds(client);
+        CodexRpcClient_ResetRuntimeState(client);
         CodexRpcClient_SetStatus(client, "Codex app server exited");
     }
 }
 
 void CodexRpcClient_Stop(CodexRpcClient *client)
 {
-    if (client->stdin_fd >= 0) {
-        close(client->stdin_fd);
-        client->stdin_fd = -1;
-    }
-
-    if (client->stdout_fd >= 0) {
-        close(client->stdout_fd);
-        client->stdout_fd = -1;
-    }
-
-    if (client->stderr_fd >= 0) {
-        close(client->stderr_fd);
-        client->stderr_fd = -1;
-    }
+    CodexRpcClient_CloseFds(client);
 
     if (client->running && client->pid > 0) {
+        const int wait_steps = 20;
+        bool exited = false;
+
         kill((pid_t)client->pid, SIGTERM);
-        waitpid((pid_t)client->pid, NULL, 0);
+        for (int i = 0; i < wait_steps; ++i) {
+            pid_t result = waitpid((pid_t)client->pid, NULL, WNOHANG);
+            if (result == (pid_t)client->pid) {
+                exited = true;
+                break;
+            }
+            {
+                struct timespec wait_time = {0, 100 * 1000 * 1000};
+                nanosleep(&wait_time, NULL);
+            }
+        }
+
+        if (!exited) {
+            kill((pid_t)client->pid, SIGKILL);
+            waitpid((pid_t)client->pid, NULL, 0);
+            CodexRpcClient_SetError(client, "server did not exit on SIGTERM; forced SIGKILL");
+        }
     }
 
-    client->pid = -1;
-    client->running = false;
-    client->initialized = false;
-    client->thread_ready = false;
-    client->turn_in_flight = false;
+    CodexRpcClient_ResetRuntimeState(client);
 }
