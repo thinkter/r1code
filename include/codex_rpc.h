@@ -10,11 +10,23 @@
 #define CODEX_RPC_MAX_MODELS 24
 #define CODEX_RPC_MAX_MODEL_ID 128
 #define CODEX_RPC_MAX_MODEL_LABEL 160
+#define CODEX_RPC_MAX_REASONING_EFFORTS 6
+#define CODEX_RPC_MAX_REASONING_EFFORT_ID 16
+#define CODEX_RPC_MAX_REASONING_EFFORT_LABEL 96
+
+typedef struct CodexRpcReasoningEffortInfo {
+    char id[CODEX_RPC_MAX_REASONING_EFFORT_ID];
+    char label[CODEX_RPC_MAX_REASONING_EFFORT_LABEL];
+    bool is_default;
+} CodexRpcReasoningEffortInfo;
 
 typedef struct CodexRpcModelInfo {
     char id[CODEX_RPC_MAX_MODEL_ID];
     char label[CODEX_RPC_MAX_MODEL_LABEL];
     bool is_default;
+    CodexRpcReasoningEffortInfo reasoning_efforts[CODEX_RPC_MAX_REASONING_EFFORTS];
+    int reasoning_effort_count;
+    int default_reasoning_effort_index;
 } CodexRpcModelInfo;
 
 typedef struct CodexRpcClient {
@@ -40,6 +52,7 @@ typedef struct CodexRpcClient {
     char last_error[CODEX_RPC_MAX_STATUS];
     char transcript[CODEX_RPC_MAX_TRANSCRIPT];
     char selected_model[CODEX_RPC_MAX_MODEL_ID];
+    char selected_reasoning_effort[CODEX_RPC_MAX_REASONING_EFFORT_ID];
 
     char stdout_buffer[8192];
     size_t stdout_buffer_len;
@@ -51,6 +64,7 @@ typedef struct CodexRpcClient {
     CodexRpcModelInfo models[CODEX_RPC_MAX_MODELS];
     int model_count;
     int selected_model_index;
+    int selected_reasoning_effort_index;
     bool models_loading;
     bool models_loaded;
 } CodexRpcClient;
@@ -62,3 +76,4 @@ void CodexRpcClient_Stop(CodexRpcClient *client);
 bool CodexRpcClient_SendPrompt(CodexRpcClient *client, const char *prompt);
 bool CodexRpcClient_RequestModelList(CodexRpcClient *client);
 void CodexRpcClient_SelectModel(CodexRpcClient *client, int index);
+void CodexRpcClient_SelectReasoningEffort(CodexRpcClient *client, int index);

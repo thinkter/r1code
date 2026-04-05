@@ -196,18 +196,135 @@ static bool JsonExtractInt(const char *json, const char *key, int *value)
     return true;
 }
 
+static bool JsonExtractArray(const char *json, const char *key, char *output, size_t output_size)
+{
+    char pattern[64];
+    const char *cursor = NULL;
+    const char *start = NULL;
+    const char *end = NULL;
+    int depth = 0;
+    bool in_string = false;
+    bool escaping = false;
+    size_t length = 0;
+
+    if (output_size == 0) {
+        return false;
+    }
+
+    snprintf(pattern, sizeof(pattern), "\"%s\":[", key);
+    cursor = strstr(json, pattern);
+    if (cursor == NULL) {
+        output[0] = '\0';
+        return false;
+    }
+
+    start = strchr(cursor, '[');
+    if (start == NULL) {
+        output[0] = '\0';
+        return false;
+    }
+
+    for (cursor = start; *cursor != '\0'; ++cursor) {
+        char ch = *cursor;
+
+        if (escaping) {
+            escaping = false;
+            continue;
+        }
+
+        if (ch == '\\' && in_string) {
+            escaping = true;
+            continue;
+        }
+
+        if (ch == '"') {
+            in_string = !in_string;
+            continue;
+        }
+
+        if (in_string) {
+            continue;
+        }
+
+        if (ch == '[') {
+            depth += 1;
+        } else if (ch == ']') {
+            depth -= 1;
+            if (depth == 0) {
+                end = cursor + 1;
+                break;
+            }
+        }
+    }
+
+    if (end == NULL) {
+        output[0] = '\0';
+        return false;
+    }
+
+    length = (size_t)(end - start);
+    if (length >= output_size) {
+        length = output_size - 1;
+    }
+
+    memcpy(output, start, length);
+    output[length] = '\0';
+    return true;
+}
+
 static void ResetModelListState(CodexRpcClient *client, bool preserve_selected_model)
 {
     if (!preserve_selected_model) {
         client->selected_model[0] = '\0';
+        client->selected_reasoning_effort[0] = '\0';
     }
 
     memset(client->models, 0, sizeof(client->models));
     client->model_count = 0;
     client->selected_model_index = -1;
+    client->selected_reasoning_effort_index = -1;
     client->models_loading = false;
     client->models_loaded = false;
     client->model_list_request_id = 0;
+}
+
+static void SyncSelectedReasoningEffort(CodexRpcClient *client)
+{
+    const CodexRpcModelInfo *model = NULL;
+
+    client->selected_reasoning_effort_index = -1;
+
+    if (client->selected_model_index < 0 || client->selected_model_index >= client->model_count) {
+        return;
+    }
+
+    model = &client->models[client->selected_model_index];
+    if (model->reasoning_effort_count <= 0) {
+        client->selected_reasoning_effort[0] = '\0';
+        return;
+    }
+
+    if (client->selected_reasoning_effort[0] != '\0') {
+        for (int i = 0; i < model->reasoning_effort_count; ++i) {
+            if (strcmp(client->selected_reasoning_effort, model->reasoning_efforts[i].id) == 0) {
+                client->selected_reasoning_effort_index = i;
+                return;
+            }
+        }
+    }
+
+    if (model->default_reasoning_effort_index >= 0 && model->default_reasoning_effort_index < model->reasoning_effort_count) {
+        client->selected_reasoning_effort_index = model->default_reasoning_effort_index;
+    } else {
+        client->selected_reasoning_effort_index = 0;
+    }
+
+    snprintf(
+        client->selected_reasoning_effort,
+        sizeof(client->selected_reasoning_effort),
+        "%s",
+        model->reasoning_efforts[client->selected_reasoning_effort_index].id
+    );
 }
 
 static void SyncSelectedModelIndex(CodexRpcClient *client)
@@ -237,6 +354,105 @@ static void SyncSelectedModelIndex(CodexRpcClient *client)
 
     client->selected_model_index = 0;
     snprintf(client->selected_model, sizeof(client->selected_model), "%s", client->models[0].id);
+    SyncSelectedReasoningEffort(client);
+}
+
+static void ParseModelReasoningEfforts(CodexRpcModelInfo *model, const char *object_json)
+{
+    char default_effort[CODEX_RPC_MAX_REASONING_EFFORT_ID];
+    char supported_json[1024];
+    const char *cursor = NULL;
+    int parsed = 0;
+
+    model->reasoning_effort_count = 0;
+    model->default_reasoning_effort_index = -1;
+    default_effort[0] = '\0';
+    supported_json[0] = '\0';
+
+    JsonExtractString(object_json, "defaultReasoningEffort", default_effort, sizeof(default_effort));
+    if (!JsonExtractArray(object_json, "supportedReasoningEfforts", supported_json, sizeof(supported_json))) {
+        return;
+    }
+
+    cursor = supported_json;
+    while (*cursor != '\0' && parsed < CODEX_RPC_MAX_REASONING_EFFORTS) {
+        const char *object_start = NULL;
+        const char *object_end = NULL;
+        int depth = 0;
+        bool in_string = false;
+        bool escaping = false;
+        char effort_json[512];
+        size_t effort_length = 0;
+        char effort_id[CODEX_RPC_MAX_REASONING_EFFORT_ID];
+
+        while (*cursor != '\0' && *cursor != '{' && *cursor != ']') {
+            ++cursor;
+        }
+
+        if (*cursor != '{') {
+            break;
+        }
+
+        object_start = cursor;
+        for (; *cursor != '\0'; ++cursor) {
+            char ch = *cursor;
+
+            if (escaping) {
+                escaping = false;
+                continue;
+            }
+
+            if (ch == '\\' && in_string) {
+                escaping = true;
+                continue;
+            }
+
+            if (ch == '"') {
+                in_string = !in_string;
+                continue;
+            }
+
+            if (in_string) {
+                continue;
+            }
+
+            if (ch == '{') {
+                depth += 1;
+            } else if (ch == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    object_end = cursor + 1;
+                    break;
+                }
+            }
+        }
+
+        if (object_end == NULL) {
+            break;
+        }
+
+        effort_length = (size_t)(object_end - object_start);
+        if (effort_length >= sizeof(effort_json)) {
+            effort_length = sizeof(effort_json) - 1;
+        }
+
+        memcpy(effort_json, object_start, effort_length);
+        effort_json[effort_length] = '\0';
+
+        if (JsonExtractString(effort_json, "reasoningEffort", effort_id, sizeof(effort_id))) {
+            snprintf(model->reasoning_efforts[parsed].id, sizeof(model->reasoning_efforts[parsed].id), "%s", effort_id);
+            snprintf(model->reasoning_efforts[parsed].label, sizeof(model->reasoning_efforts[parsed].label), "%s", effort_id);
+            model->reasoning_efforts[parsed].is_default = strcmp(default_effort, effort_id) == 0;
+            if (model->reasoning_efforts[parsed].is_default) {
+                model->default_reasoning_effort_index = parsed;
+            }
+            parsed += 1;
+        }
+
+        cursor = object_end;
+    }
+
+    model->reasoning_effort_count = parsed;
 }
 
 static bool ParseModelListResponse(CodexRpcClient *client, const char *json)
@@ -336,6 +552,7 @@ static bool ParseModelListResponse(CodexRpcClient *client, const char *json)
             snprintf(client->models[parsed].label, sizeof(client->models[parsed].label), "%s | %s", display_name, model_id);
         }
         client->models[parsed].is_default = strstr(object_json, "\"isDefault\":true") != NULL;
+        ParseModelReasoningEfforts(&client->models[parsed], object_json);
         parsed += 1;
         cursor = object_end;
     }
@@ -344,6 +561,7 @@ static bool ParseModelListResponse(CodexRpcClient *client, const char *json)
     client->models_loaded = parsed > 0;
     client->models_loading = false;
     SyncSelectedModelIndex(client);
+    SyncSelectedReasoningEffort(client);
     return parsed > 0;
 }
 
@@ -570,8 +788,10 @@ bool CodexRpcClient_SendPrompt(CodexRpcClient *client, const char *prompt)
     char escaped_prompt[(CODEX_RPC_MAX_PROMPT * 6)];
     char escaped_cwd[1024];
     char escaped_model[CODEX_RPC_MAX_MODEL_ID * 2];
+    char escaped_effort[CODEX_RPC_MAX_REASONING_EFFORT_ID * 2];
     char payload[4352];
     char model_fragment[320] = "";
+    char effort_fragment[96] = "";
     int request_id = 0;
 
     if (!client->running || !client->initialized || !client->thread_ready || client->turn_in_flight) {
@@ -593,6 +813,13 @@ bool CodexRpcClient_SendPrompt(CodexRpcClient *client, const char *prompt)
         }
         snprintf(model_fragment, sizeof(model_fragment), ",\"model\":\"%s\"", escaped_model);
     }
+    if (client->selected_reasoning_effort[0] != '\0') {
+        if (!JsonEscape(client->selected_reasoning_effort, escaped_effort, sizeof(escaped_effort))) {
+            CodexRpcClient_SetError(client, "reasoning effort is too long to encode");
+            return false;
+        }
+        snprintf(effort_fragment, sizeof(effort_fragment), ",\"effort\":\"%s\"", escaped_effort);
+    }
 
     request_id = client->next_request_id++;
     client->turn_start_request_id = request_id;
@@ -601,12 +828,13 @@ bool CodexRpcClient_SendPrompt(CodexRpcClient *client, const char *prompt)
     snprintf(
         payload,
         sizeof(payload),
-        "{\"id\":%d,\"method\":\"turn/start\",\"params\":{\"threadId\":\"%s\",\"cwd\":\"%s\",\"input\":[{\"type\":\"text\",\"text\":\"%s\"}]%s}}",
+        "{\"id\":%d,\"method\":\"turn/start\",\"params\":{\"threadId\":\"%s\",\"cwd\":\"%s\",\"input\":[{\"type\":\"text\",\"text\":\"%s\"}]%s%s}}",
         request_id,
         client->thread_id,
         escaped_cwd,
         escaped_prompt,
-        model_fragment
+        model_fragment,
+        effort_fragment
     );
 
     CodexRpcClient_SetStatus(client, "Running turn...");
@@ -628,7 +856,26 @@ void CodexRpcClient_SelectModel(CodexRpcClient *client, int index)
 
     client->selected_model_index = index;
     snprintf(client->selected_model, sizeof(client->selected_model), "%s", client->models[index].id);
+    SyncSelectedReasoningEffort(client);
     CodexRpcClient_SetStatus(client, "Selected model: %s", client->models[index].label);
+}
+
+void CodexRpcClient_SelectReasoningEffort(CodexRpcClient *client, int index)
+{
+    const CodexRpcModelInfo *model = NULL;
+
+    if (client->selected_model_index < 0 || client->selected_model_index >= client->model_count) {
+        return;
+    }
+
+    model = &client->models[client->selected_model_index];
+    if (index < 0 || index >= model->reasoning_effort_count) {
+        return;
+    }
+
+    client->selected_reasoning_effort_index = index;
+    snprintf(client->selected_reasoning_effort, sizeof(client->selected_reasoning_effort), "%s", model->reasoning_efforts[index].id);
+    CodexRpcClient_SetStatus(client, "Selected reasoning: %s", model->reasoning_efforts[index].label);
 }
 
 static void CodexRpcClient_HandleResponse(CodexRpcClient *client, const char *line, int request_id)

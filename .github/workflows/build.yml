@@ -1,0 +1,75 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runs_on }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runs_on: ubuntu-latest
+            artifact_name: r1code-linux-x64
+            artifact_path: bin/Release/r1code
+            premake_command: cd build && ./premake5 gmake
+            build_command: make config=release_x64
+          - name: macOS
+            runs_on: macos-13
+            artifact_name: r1code-macos-x64
+            artifact_path: bin/Release/r1code
+            premake_command: cd build && ./premake5.osx gmake
+            build_command: make config=release_x64
+          - name: Windows
+            runs_on: windows-2022
+            artifact_name: r1code-windows-x64
+            artifact_path: bin/Release/r1code.exe
+            premake_command: Set-Location build; .\\premake5.exe vs2022
+            build_command: msbuild .\\r1code.sln /m /p:Configuration=Release /p:Platform=x64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxkbcommon-dev \
+            libxrandr-dev
+
+      - name: Make Premake binaries executable
+        if: runner.os != 'Windows'
+        run: chmod +x build/premake5 build/premake5.osx
+
+      - name: Generate build files
+        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
+        run: ${{ matrix.premake_command }}
+
+      - name: Build release binary
+        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
+        run: ${{ matrix.build_command }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error

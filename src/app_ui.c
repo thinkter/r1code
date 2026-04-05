@@ -116,6 +116,41 @@ static void BuildModelOptions(const CodexRpcClient *client, char *output, size_t
     output[out] = '\0';
 }
 
+static void BuildReasoningOptions(const CodexRpcClient *client, char *output, size_t output_size)
+{
+    const CodexRpcModelInfo *model = NULL;
+    size_t out = 0;
+
+    if (output_size == 0) {
+        return;
+    }
+
+    output[0] = '\0';
+    if (client->selected_model_index < 0 || client->selected_model_index >= client->model_count) {
+        return;
+    }
+
+    model = &client->models[client->selected_model_index];
+    for (int i = 0; i < model->reasoning_effort_count && out + 1 < output_size; ++i) {
+        size_t label_length = strlen(model->reasoning_efforts[i].label);
+        size_t writable = output_size - out - 1;
+
+        if (i > 0 && writable > 1) {
+            output[out++] = ';';
+            writable = output_size - out - 1;
+        }
+
+        if (label_length > writable) {
+            label_length = writable;
+        }
+
+        memcpy(output + out, model->reasoning_efforts[i].label, label_length);
+        out += label_length;
+    }
+
+    output[out] = '\0';
+}
+
 int RunApplication(void)
 {
     CodexRpcClient client;
@@ -125,9 +160,13 @@ int RunApplication(void)
     Vector2 transcript_scroll = {0};
     FolderPickerTask folder_picker_task = {0};
     char model_options_cache[(CODEX_RPC_MAX_MODELS * (CODEX_RPC_MAX_MODEL_LABEL + 1)) + 1] = "";
+    char reasoning_options_cache[(CODEX_RPC_MAX_REASONING_EFFORTS * (CODEX_RPC_MAX_REASONING_EFFORT_LABEL + 1)) + 1] = "";
     int model_dropdown_index = -1;
     bool model_dropdown_edit_mode = false;
+    int reasoning_dropdown_index = -1;
+    bool reasoning_dropdown_edit_mode = false;
     int last_model_count = -1;
+    int last_reasoning_model_index = -2;
 
     SetConfigFlags(FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI | FLAG_WINDOW_RESIZABLE);
     InitWindow(1440, 900, "Codex RPC Wrapper");
@@ -222,11 +261,23 @@ int RunApplication(void)
 
         if (client.model_count != last_model_count) {
             BuildModelOptions(&client, model_options_cache, sizeof(model_options_cache));
+            BuildReasoningOptions(&client, reasoning_options_cache, sizeof(reasoning_options_cache));
             last_model_count = client.model_count;
+            last_reasoning_model_index = client.selected_model_index;
+        }
+
+        if (client.selected_model_index != last_reasoning_model_index) {
+            BuildReasoningOptions(&client, reasoning_options_cache, sizeof(reasoning_options_cache));
+            last_reasoning_model_index = client.selected_model_index;
+            reasoning_dropdown_edit_mode = false;
         }
 
         if (client.selected_model_index >= 0) {
             model_dropdown_index = client.selected_model_index;
+        }
+
+        if (client.selected_reasoning_effort_index >= 0) {
+            reasoning_dropdown_index = client.selected_reasoning_effort_index;
         }
 
         if (PollFolderPickerTask(&folder_picker_task)) {
@@ -269,14 +320,15 @@ int RunApplication(void)
         GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 88, state_panel.width - 36, 20}, TextFormat("thread ready: %s", client.thread_ready ? "yes" : "no"));
         GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 112, state_panel.width - 36, 20}, TextFormat("turn in flight: %s", client.turn_in_flight ? "yes" : "no"));
         GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 144, state_panel.width - 24, 20}, "model");
-        GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 210, state_panel.width - 24, 20}, "working folder");
+        GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 210, state_panel.width - 24, 20}, "reasoning");
+        GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 276, state_panel.width - 24, 20}, "working folder");
         GuiSetStyle(DEFAULT, TEXT_WRAP_MODE, TEXT_WRAP_WORD);
         GuiSetStyle(DEFAULT, TEXT_ALIGNMENT_VERTICAL, TEXT_ALIGN_TOP);
-        GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 236, state_panel.width - 36, 74}, client.cwd);
-        GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 316, state_panel.width - 24, 20}, "thread id");
-        GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 342, state_panel.width - 36, 60}, client.thread_id[0] != '\0' ? client.thread_id : "(none)");
-        GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 408, state_panel.width - 24, 20}, "last error");
-        GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 434, state_panel.width - 36, state_panel.height - 456}, client.last_error[0] != '\0' ? client.last_error : "(none)");
+        GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 302, state_panel.width - 36, 74}, client.cwd);
+        GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 382, state_panel.width - 24, 20}, "thread id");
+        GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 408, state_panel.width - 36, 60}, client.thread_id[0] != '\0' ? client.thread_id : "(none)");
+        GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 474, state_panel.width - 24, 20}, "last error");
+        GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 500, state_panel.width - 36, state_panel.height > 522 ? state_panel.height - 522 : 24}, client.last_error[0] != '\0' ? client.last_error : "(none)");
         GuiSetStyle(DEFAULT, TEXT_WRAP_MODE, TEXT_WRAP_NONE);
         GuiSetStyle(DEFAULT, TEXT_ALIGNMENT_VERTICAL, TEXT_ALIGN_MIDDLE);
 
@@ -287,10 +339,28 @@ int RunApplication(void)
                     CodexRpcClient_SelectModel(&client, model_dropdown_index);
                 }
                 model_dropdown_edit_mode = !model_dropdown_edit_mode;
+                if (model_dropdown_edit_mode) {
+                    reasoning_dropdown_edit_mode = false;
+                }
             }
         } else {
             const char *model_status = client.models_loading ? "Loading available models..." : "No model list yet. Press R to reconnect.";
             GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 170, state_panel.width - 36, 40}, model_status);
+        }
+
+        if (!model_dropdown_edit_mode && client.selected_model_index >= 0 && reasoning_options_cache[0] != '\0') {
+            Rectangle reasoning_dropdown = {state_panel.x + 18, state_panel.y + 236, state_panel.width - 36, 28};
+            if (GuiDropdownBox(reasoning_dropdown, reasoning_options_cache, &reasoning_dropdown_index, reasoning_dropdown_edit_mode)) {
+                if (reasoning_dropdown_edit_mode) {
+                    CodexRpcClient_SelectReasoningEffort(&client, reasoning_dropdown_index);
+                }
+                reasoning_dropdown_edit_mode = !reasoning_dropdown_edit_mode;
+                if (reasoning_dropdown_edit_mode) {
+                    model_dropdown_edit_mode = false;
+                }
+            }
+        } else if (!model_dropdown_edit_mode) {
+            GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 236, state_panel.width - 36, 36}, "Reasoning options load with the selected model.");
         }
 
         GuiPanel(prompt_box, "Prompt");
