@@ -19,6 +19,7 @@ typedef enum RequestKind {
     REQUEST_KIND_INITIALIZE,
     REQUEST_KIND_THREAD_START,
     REQUEST_KIND_TURN_START,
+    REQUEST_KIND_MODEL_LIST,
 } RequestKind;
 
 static void CodexRpcClient_SetStatus(CodexRpcClient *client, const char *format, ...)
@@ -37,23 +38,14 @@ static void CodexRpcClient_SetError(CodexRpcClient *client, const char *format, 
     va_end(args);
 }
 
-static void CodexRpcClient_AddLogLine(CodexRpcClient *client, const char *line)
+static void CodexRpcClient_LogLine(bool is_stderr, const char *line)
 {
     if (line == NULL || line[0] == '\0') {
         return;
     }
 
-    if (client->log_line_count < CODEX_RPC_MAX_LOG_LINES) {
-        snprintf(client->log_lines[client->log_line_count], CODEX_RPC_MAX_LOG_LINE, "%s", line);
-        client->log_line_count += 1;
-        return;
-    }
-
-    for (int i = 1; i < CODEX_RPC_MAX_LOG_LINES; ++i) {
-        memcpy(client->log_lines[i - 1], client->log_lines[i], CODEX_RPC_MAX_LOG_LINE);
-    }
-
-    snprintf(client->log_lines[CODEX_RPC_MAX_LOG_LINES - 1], CODEX_RPC_MAX_LOG_LINE, "%s", line);
+    fprintf(stderr, "[codex-rpc %s] %s\n", is_stderr ? "stderr" : "stdout", line);
+    fflush(stderr);
 }
 
 static bool CodexRpcClient_SetNonBlocking(int fd)
@@ -204,6 +196,157 @@ static bool JsonExtractInt(const char *json, const char *key, int *value)
     return true;
 }
 
+static void ResetModelListState(CodexRpcClient *client, bool preserve_selected_model)
+{
+    if (!preserve_selected_model) {
+        client->selected_model[0] = '\0';
+    }
+
+    memset(client->models, 0, sizeof(client->models));
+    client->model_count = 0;
+    client->selected_model_index = -1;
+    client->models_loading = false;
+    client->models_loaded = false;
+    client->model_list_request_id = 0;
+}
+
+static void SyncSelectedModelIndex(CodexRpcClient *client)
+{
+    client->selected_model_index = -1;
+
+    if (client->model_count <= 0) {
+        return;
+    }
+
+    if (client->selected_model[0] != '\0') {
+        for (int i = 0; i < client->model_count; ++i) {
+            if (strcmp(client->selected_model, client->models[i].id) == 0) {
+                client->selected_model_index = i;
+                return;
+            }
+        }
+    }
+
+    for (int i = 0; i < client->model_count; ++i) {
+        if (client->models[i].is_default) {
+            client->selected_model_index = i;
+            snprintf(client->selected_model, sizeof(client->selected_model), "%s", client->models[i].id);
+            return;
+        }
+    }
+
+    client->selected_model_index = 0;
+    snprintf(client->selected_model, sizeof(client->selected_model), "%s", client->models[0].id);
+}
+
+static bool ParseModelListResponse(CodexRpcClient *client, const char *json)
+{
+    const char *data = strstr(json, "\"data\":[");
+    const char *cursor = NULL;
+    int parsed = 0;
+
+    if (data == NULL) {
+        return false;
+    }
+
+    cursor = strchr(data, '[');
+    if (cursor == NULL) {
+        return false;
+    }
+    cursor += 1;
+
+    while (*cursor != '\0' && *cursor != ']' && parsed < CODEX_RPC_MAX_MODELS) {
+        int depth = 0;
+        bool in_string = false;
+        bool escaping = false;
+        const char *object_start = NULL;
+        const char *object_end = NULL;
+        char object_json[2048];
+        size_t object_length = 0;
+        char model_id[CODEX_RPC_MAX_MODEL_ID];
+        char display_name[CODEX_RPC_MAX_MODEL_LABEL];
+
+        while (*cursor != '\0' && *cursor != '{' && *cursor != ']') {
+            ++cursor;
+        }
+
+        if (*cursor != '{') {
+            break;
+        }
+
+        object_start = cursor;
+        for (; *cursor != '\0'; ++cursor) {
+            char ch = *cursor;
+
+            if (escaping) {
+                escaping = false;
+                continue;
+            }
+
+            if (ch == '\\' && in_string) {
+                escaping = true;
+                continue;
+            }
+
+            if (ch == '"') {
+                in_string = !in_string;
+                continue;
+            }
+
+            if (in_string) {
+                continue;
+            }
+
+            if (ch == '{') {
+                depth += 1;
+            } else if (ch == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    object_end = cursor + 1;
+                    break;
+                }
+            }
+        }
+
+        if (object_end == NULL) {
+            break;
+        }
+
+        object_length = (size_t)(object_end - object_start);
+        if (object_length >= sizeof(object_json)) {
+            object_length = sizeof(object_json) - 1;
+        }
+
+        memcpy(object_json, object_start, object_length);
+        object_json[object_length] = '\0';
+
+        if (!JsonExtractString(object_json, "model", model_id, sizeof(model_id))) {
+            cursor = object_end;
+            continue;
+        }
+
+        if (!JsonExtractString(object_json, "displayName", display_name, sizeof(display_name))) {
+            snprintf(display_name, sizeof(display_name), "%s", model_id);
+        }
+
+        snprintf(client->models[parsed].id, sizeof(client->models[parsed].id), "%s", model_id);
+        if (strcmp(display_name, model_id) == 0) {
+            snprintf(client->models[parsed].label, sizeof(client->models[parsed].label), "%s", model_id);
+        } else {
+            snprintf(client->models[parsed].label, sizeof(client->models[parsed].label), "%s | %s", display_name, model_id);
+        }
+        client->models[parsed].is_default = strstr(object_json, "\"isDefault\":true") != NULL;
+        parsed += 1;
+        cursor = object_end;
+    }
+
+    client->model_count = parsed;
+    client->models_loaded = parsed > 0;
+    client->models_loading = false;
+    SyncSelectedModelIndex(client);
+    return parsed > 0;
+}
+
 static void TranscriptAppend(CodexRpcClient *client, const char *text)
 {
     size_t current_len = strlen(client->transcript);
@@ -274,10 +417,8 @@ static void CodexRpcClient_MarkOversizeLineDiscard(
     bool *discarding_oversize_line
 )
 {
-    CodexRpcClient_AddLogLine(
-        client,
-        is_stderr ? "[stderr] dropping oversized line until newline" : "[stdout] dropping oversized line until newline"
-    );
+    (void)client;
+    CodexRpcClient_LogLine(is_stderr, "dropping oversized line until newline");
     *discarding_oversize_line = true;
     *buffer_len = 0;
 }
@@ -328,6 +469,10 @@ static RequestKind CodexRpcClient_GetRequestKind(const CodexRpcClient *client, i
         return REQUEST_KIND_TURN_START;
     }
 
+    if (request_id == client->model_list_request_id) {
+        return REQUEST_KIND_MODEL_LIST;
+    }
+
     return REQUEST_KIND_UNKNOWN;
 }
 
@@ -357,32 +502,76 @@ static bool CodexRpcClient_SendInitialized(CodexRpcClient *client)
 static bool CodexRpcClient_SendThreadStart(CodexRpcClient *client)
 {
     char escaped_cwd[1024];
-    char payload[2048];
+    char escaped_model[CODEX_RPC_MAX_MODEL_ID * 2];
+    char payload[2304];
+    char model_fragment[320] = "";
     int request_id = client->next_request_id++;
 
     if (!JsonEscape(client->cwd, escaped_cwd, sizeof(escaped_cwd))) {
         CodexRpcClient_SetError(client, "cwd is too long to encode");
         return false;
     }
+
+    if (client->selected_model[0] != '\0') {
+        if (!JsonEscape(client->selected_model, escaped_model, sizeof(escaped_model))) {
+            CodexRpcClient_SetError(client, "model is too long to encode");
+            return false;
+        }
+        snprintf(model_fragment, sizeof(model_fragment), ",\"model\":\"%s\"", escaped_model);
+    }
+
     client->thread_start_request_id = request_id;
 
     snprintf(
         payload,
         sizeof(payload),
-        "{\"id\":%d,\"method\":\"thread/start\",\"params\":{\"cwd\":\"%s\",\"approvalPolicy\":\"never\",\"sandbox\":\"workspace-write\",\"personality\":\"pragmatic\"}}",
+        "{\"id\":%d,\"method\":\"thread/start\",\"params\":{\"cwd\":\"%s\",\"approvalPolicy\":\"never\",\"sandbox\":\"workspace-write\",\"personality\":\"pragmatic\"%s}}",
         request_id,
-        escaped_cwd
+        escaped_cwd,
+        model_fragment
     );
 
     CodexRpcClient_SetStatus(client, "Creating thread...");
     return CodexRpcClient_SendRaw(client, payload);
 }
 
+bool CodexRpcClient_RequestModelList(CodexRpcClient *client)
+{
+    char payload[256];
+    int request_id = 0;
+
+    if (!client->running || !client->initialized || client->models_loading) {
+        return false;
+    }
+
+    request_id = client->next_request_id++;
+    client->model_list_request_id = request_id;
+    client->models_loading = true;
+
+    snprintf(
+        payload,
+        sizeof(payload),
+        "{\"id\":%d,\"method\":\"model/list\",\"params\":{\"limit\":%d}}",
+        request_id,
+        CODEX_RPC_MAX_MODELS
+    );
+
+    if (!CodexRpcClient_SendRaw(client, payload)) {
+        client->models_loading = false;
+        return false;
+    }
+
+    CodexRpcClient_SetStatus(client, "Loading models...");
+    return true;
+}
+
 bool CodexRpcClient_SendPrompt(CodexRpcClient *client, const char *prompt)
 {
     char escaped_prompt[(CODEX_RPC_MAX_PROMPT * 6)];
     char escaped_cwd[1024];
-    char payload[4096];
+    char escaped_model[CODEX_RPC_MAX_MODEL_ID * 2];
+    char payload[4352];
+    char model_fragment[320] = "";
     int request_id = 0;
 
     if (!client->running || !client->initialized || !client->thread_ready || client->turn_in_flight) {
@@ -397,6 +586,13 @@ bool CodexRpcClient_SendPrompt(CodexRpcClient *client, const char *prompt)
         CodexRpcClient_SetError(client, "cwd is too long to encode");
         return false;
     }
+    if (client->selected_model[0] != '\0') {
+        if (!JsonEscape(client->selected_model, escaped_model, sizeof(escaped_model))) {
+            CodexRpcClient_SetError(client, "model is too long to encode");
+            return false;
+        }
+        snprintf(model_fragment, sizeof(model_fragment), ",\"model\":\"%s\"", escaped_model);
+    }
 
     request_id = client->next_request_id++;
     client->turn_start_request_id = request_id;
@@ -405,11 +601,12 @@ bool CodexRpcClient_SendPrompt(CodexRpcClient *client, const char *prompt)
     snprintf(
         payload,
         sizeof(payload),
-        "{\"id\":%d,\"method\":\"turn/start\",\"params\":{\"threadId\":\"%s\",\"cwd\":\"%s\",\"input\":[{\"type\":\"text\",\"text\":\"%s\"}]}}",
+        "{\"id\":%d,\"method\":\"turn/start\",\"params\":{\"threadId\":\"%s\",\"cwd\":\"%s\",\"input\":[{\"type\":\"text\",\"text\":\"%s\"}]%s}}",
         request_id,
         client->thread_id,
         escaped_cwd,
-        escaped_prompt
+        escaped_prompt,
+        model_fragment
     );
 
     CodexRpcClient_SetStatus(client, "Running turn...");
@@ -421,6 +618,17 @@ bool CodexRpcClient_SendPrompt(CodexRpcClient *client, const char *prompt)
     TranscriptAppendTurnEnvelope(client, prompt);
 
     return true;
+}
+
+void CodexRpcClient_SelectModel(CodexRpcClient *client, int index)
+{
+    if (index < 0 || index >= client->model_count) {
+        return;
+    }
+
+    client->selected_model_index = index;
+    snprintf(client->selected_model, sizeof(client->selected_model), "%s", client->models[index].id);
+    CodexRpcClient_SetStatus(client, "Selected model: %s", client->models[index].label);
 }
 
 static void CodexRpcClient_HandleResponse(CodexRpcClient *client, const char *line, int request_id)
@@ -460,10 +668,23 @@ static void CodexRpcClient_HandleResponse(CodexRpcClient *client, const char *li
             } else {
                 CodexRpcClient_SetStatus(client, "Thread created");
             }
+            CodexRpcClient_RequestModelList(client);
             break;
 
         case REQUEST_KIND_TURN_START:
             CodexRpcClient_SetStatus(client, "Turn started");
+            break;
+
+        case REQUEST_KIND_MODEL_LIST:
+            if (!ParseModelListResponse(client, line)) {
+                client->models_loading = false;
+                CodexRpcClient_SetError(client, "Failed to parse model list response");
+                CodexRpcClient_SetStatus(client, "Model list unavailable");
+            } else if (client->selected_model_index >= 0) {
+                CodexRpcClient_SetStatus(client, "Models loaded (%d). Active: %s", client->model_count, client->models[client->selected_model_index].label);
+            } else {
+                CodexRpcClient_SetStatus(client, "Models loaded (%d)", client->model_count);
+            }
             break;
 
         case REQUEST_KIND_UNKNOWN:
@@ -485,6 +706,7 @@ static void CodexRpcClient_HandleNotification(CodexRpcClient *client, const char
             client->thread_ready = true;
         }
         CodexRpcClient_SetStatus(client, "Thread ready");
+        CodexRpcClient_RequestModelList(client);
         return;
     }
 
@@ -524,11 +746,11 @@ static void CodexRpcClient_HandleLine(CodexRpcClient *client, const char *line, 
     int request_id = 0;
 
     if (is_stderr) {
-        CodexRpcClient_AddLogLine(client, line);
+        CodexRpcClient_LogLine(true, line);
         return;
     }
 
-    CodexRpcClient_AddLogLine(client, line);
+    CodexRpcClient_LogLine(false, line);
 
     if (JsonExtractInt(line, "id", &request_id) && (strstr(line, "\"result\":") != NULL || strstr(line, "\"error\":") != NULL)) {
         CodexRpcClient_HandleResponse(client, line, request_id);
@@ -639,6 +861,7 @@ void CodexRpcClient_Init(CodexRpcClient *client, const char *cwd)
     client->next_request_id = 1;
 
     snprintf(client->cwd, sizeof(client->cwd), "%s", cwd != NULL ? cwd : ".");
+    ResetModelListState(client, false);
     CodexRpcClient_SetStatus(client, "Press R to launch Codex app server");
 }
 
@@ -712,7 +935,7 @@ bool CodexRpcClient_Start(CodexRpcClient *client)
     client->stdout_discarding_oversize_line = false;
     client->stderr_buffer_len = 0;
     client->stderr_discarding_oversize_line = false;
-    client->log_line_count = 0;
+    ResetModelListState(client, true);
 
     if (!CodexRpcClient_SetNonBlocking(client->stdout_fd) || !CodexRpcClient_SetNonBlocking(client->stderr_fd)) {
         CodexRpcClient_SetError(client, "failed to set non-blocking pipes");

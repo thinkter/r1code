@@ -11,11 +11,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-
-#define UI_LOG_FONT_SIZE 16.0f
 
 typedef struct FolderPickerTask {
     pthread_t thread;
@@ -90,24 +87,7 @@ static void JoinFolderPickerTaskIfActive(FolderPickerTask *task)
     atomic_store_explicit(&task->active, false, memory_order_release);
 }
 
-static uint32_t HashLogLines(const CodexRpcClient *client)
-{
-    uint32_t hash = 2166136261u;
-
-    for (int i = 0; i < client->log_line_count; ++i) {
-        const char *line = client->log_lines[i];
-        for (size_t j = 0; line[j] != '\0'; ++j) {
-            hash ^= (uint32_t)(unsigned char)line[j];
-            hash *= 16777619u;
-        }
-        hash ^= (uint32_t)'\n';
-        hash *= 16777619u;
-    }
-
-    return hash ^ (uint32_t)client->log_line_count;
-}
-
-static void BuildJoinedLogs(const CodexRpcClient *client, char *output, size_t output_size)
+static void BuildModelOptions(const CodexRpcClient *client, char *output, size_t output_size)
 {
     size_t out = 0;
 
@@ -115,26 +95,22 @@ static void BuildJoinedLogs(const CodexRpcClient *client, char *output, size_t o
         return;
     }
 
-    if (client->log_line_count <= 0) {
-        snprintf(output, output_size, "%s", "No transport log yet.");
-        return;
-    }
-
     output[0] = '\0';
-    for (int i = 0; i < client->log_line_count && out + 1 < output_size; ++i) {
-        const char *line = client->log_lines[i];
-        size_t line_length = strlen(line);
+    for (int i = 0; i < client->model_count && out + 1 < output_size; ++i) {
+        size_t label_length = strlen(client->models[i].label);
         size_t writable = output_size - out - 1;
 
-        if (line_length > writable) {
-            line_length = writable;
+        if (i > 0 && writable > 1) {
+            output[out++] = ';';
+            writable = output_size - out - 1;
         }
-        memcpy(output + out, line, line_length);
-        out += line_length;
 
-        if ((i + 1) < client->log_line_count && out + 1 < output_size) {
-            output[out++] = '\n';
+        if (label_length > writable) {
+            label_length = writable;
         }
+
+        memcpy(output + out, client->models[i].label, label_length);
+        out += label_length;
     }
 
     output[out] = '\0';
@@ -147,11 +123,11 @@ int RunApplication(void)
     char prompt[CODEX_RPC_MAX_PROMPT] = "Summarize what this workspace contains.";
     bool prompt_edit_mode = false;
     Vector2 transcript_scroll = {0};
-    Vector2 log_scroll = {0};
     FolderPickerTask folder_picker_task = {0};
-    char joined_logs_cache[CODEX_RPC_MAX_LOG_LINES * CODEX_RPC_MAX_LOG_LINE] = "No transport log yet.";
-    uint32_t last_log_hash = 0;
-    int last_log_count = -1;
+    char model_options_cache[(CODEX_RPC_MAX_MODELS * (CODEX_RPC_MAX_MODEL_LABEL + 1)) + 1] = "";
+    int model_dropdown_index = -1;
+    bool model_dropdown_edit_mode = false;
+    int last_model_count = -1;
 
     SetConfigFlags(FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI | FLAG_WINDOW_RESIZABLE);
     InitWindow(1440, 900, "Codex RPC Wrapper");
@@ -173,14 +149,12 @@ int RunApplication(void)
         int content_bottom = screen_height - margin;
         int available_height = content_bottom - content_top;
         int prompt_height = 96;
-        int log_height = available_height > 320 ? 140 : 110;
-        int center_height = available_height - prompt_height - log_height - (gap * 2);
+        int center_height = available_height - prompt_height - gap;
         int content_width = screen_width - (margin * 2);
         int side_width = 300;
         int left_width = 0;
         int right_x = 0;
         int prompt_y = content_top + center_height + gap;
-        int log_y = prompt_y + prompt_height + gap;
         Rectangle header_panel = {(float)margin, (float)margin, (float)(screen_width - (margin * 2)), (float)header_height};
         Rectangle header_title = {(float)(margin + 16), (float)(margin + 8), 460.0f, 24.0f};
         Rectangle header_status = {(float)(margin + 16), (float)(margin + 34), (float)(screen_width - (margin * 2) - 260), 20.0f};
@@ -191,7 +165,6 @@ int RunApplication(void)
         Rectangle prompt_input = {(float)(margin + 18), (float)(prompt_y + 44), (float)(screen_width - (margin * 2) - 36), 36.0f};
         Rectangle prompt_hint = {(float)(margin + 18), (float)(prompt_y + 18), (float)(screen_width - (margin * 2) - 160), 18.0f};
         Rectangle send_button = {(float)(screen_width - margin - 118), (float)(prompt_y + 14), 100.0f, 26.0f};
-        Rectangle log_panel = {(float)margin, (float)log_y, (float)(screen_width - (margin * 2)), (float)log_height};
 
         if (content_width < 900) {
             side_width = 240;
@@ -216,12 +189,10 @@ int RunApplication(void)
         if (center_height < 180) {
             center_height = 180;
             prompt_y = content_top + center_height + gap;
-            log_y = prompt_y + prompt_height + gap;
             prompt_box.y = (float)prompt_y;
             prompt_input.y = (float)(prompt_y + 44);
             prompt_hint.y = (float)(prompt_y + 18);
             send_button.y = (float)(prompt_y + 14);
-            log_panel.y = (float)log_y;
         }
 
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
@@ -248,6 +219,15 @@ int RunApplication(void)
         }
 
         CodexRpcClient_Update(&client);
+
+        if (client.model_count != last_model_count) {
+            BuildModelOptions(&client, model_options_cache, sizeof(model_options_cache));
+            last_model_count = client.model_count;
+        }
+
+        if (client.selected_model_index >= 0) {
+            model_dropdown_index = client.selected_model_index;
+        }
 
         if (PollFolderPickerTask(&folder_picker_task)) {
             if (folder_picker_task.success) {
@@ -288,16 +268,30 @@ int RunApplication(void)
         GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 64, state_panel.width - 36, 20}, TextFormat("initialized: %s", client.initialized ? "yes" : "no"));
         GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 88, state_panel.width - 36, 20}, TextFormat("thread ready: %s", client.thread_ready ? "yes" : "no"));
         GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 112, state_panel.width - 36, 20}, TextFormat("turn in flight: %s", client.turn_in_flight ? "yes" : "no"));
-        GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 144, state_panel.width - 24, 20}, "working folder");
+        GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 144, state_panel.width - 24, 20}, "model");
+        GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 210, state_panel.width - 24, 20}, "working folder");
         GuiSetStyle(DEFAULT, TEXT_WRAP_MODE, TEXT_WRAP_WORD);
         GuiSetStyle(DEFAULT, TEXT_ALIGNMENT_VERTICAL, TEXT_ALIGN_TOP);
-        GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 170, state_panel.width - 36, 74}, client.cwd);
-        GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 250, state_panel.width - 24, 20}, "thread id");
-        GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 276, state_panel.width - 36, 60}, client.thread_id[0] != '\0' ? client.thread_id : "(none)");
-        GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 342, state_panel.width - 24, 20}, "last error");
-        GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 368, state_panel.width - 36, state_panel.height - 390}, client.last_error[0] != '\0' ? client.last_error : "(none)");
+        GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 236, state_panel.width - 36, 74}, client.cwd);
+        GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 316, state_panel.width - 24, 20}, "thread id");
+        GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 342, state_panel.width - 36, 60}, client.thread_id[0] != '\0' ? client.thread_id : "(none)");
+        GuiLine((Rectangle){state_panel.x + 12, state_panel.y + 408, state_panel.width - 24, 20}, "last error");
+        GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 434, state_panel.width - 36, state_panel.height - 456}, client.last_error[0] != '\0' ? client.last_error : "(none)");
         GuiSetStyle(DEFAULT, TEXT_WRAP_MODE, TEXT_WRAP_NONE);
         GuiSetStyle(DEFAULT, TEXT_ALIGNMENT_VERTICAL, TEXT_ALIGN_MIDDLE);
+
+        if (client.model_count > 0 && model_options_cache[0] != '\0') {
+            Rectangle model_dropdown = {state_panel.x + 18, state_panel.y + 170, state_panel.width - 36, 28};
+            if (GuiDropdownBox(model_dropdown, model_options_cache, &model_dropdown_index, model_dropdown_edit_mode)) {
+                if (model_dropdown_edit_mode) {
+                    CodexRpcClient_SelectModel(&client, model_dropdown_index);
+                }
+                model_dropdown_edit_mode = !model_dropdown_edit_mode;
+            }
+        } else {
+            const char *model_status = client.models_loading ? "Loading available models..." : "No model list yet. Press R to reconnect.";
+            GuiLabel((Rectangle){state_panel.x + 18, state_panel.y + 170, state_panel.width - 36, 40}, model_status);
+        }
 
         GuiPanel(prompt_box, "Prompt");
         GuiLabel(prompt_hint, prompt_edit_mode ? "Press Enter to commit, Esc to stop editing" : "Click the textbox to edit the next prompt");
@@ -323,16 +317,6 @@ int RunApplication(void)
             } else {
                 prompt_edit_mode = true;
             }
-        }
-
-        {
-            uint32_t current_log_hash = HashLogLines(&client);
-            if (client.log_line_count != last_log_count || current_log_hash != last_log_hash) {
-                BuildJoinedLogs(&client, joined_logs_cache, sizeof(joined_logs_cache));
-                last_log_hash = current_log_hash;
-                last_log_count = client.log_line_count;
-            }
-            DrawScrollTextPanel(ui_font, log_panel, "Transport Log", joined_logs_cache, UI_LOG_FONT_SIZE, &log_scroll, log_height - 12);
         }
 
         GuiStatusBar(

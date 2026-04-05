@@ -7,8 +7,15 @@
 #define CODEX_RPC_MAX_THREAD_ID 128
 #define CODEX_RPC_MAX_PROMPT 1024
 #define CODEX_RPC_MAX_TRANSCRIPT 16384
-#define CODEX_RPC_MAX_LOG_LINES 14
-#define CODEX_RPC_MAX_LOG_LINE 256
+#define CODEX_RPC_MAX_MODELS 24
+#define CODEX_RPC_MAX_MODEL_ID 128
+#define CODEX_RPC_MAX_MODEL_LABEL 160
+
+typedef struct CodexRpcModelInfo {
+    char id[CODEX_RPC_MAX_MODEL_ID];
+    char label[CODEX_RPC_MAX_MODEL_LABEL];
+    bool is_default;
+} CodexRpcModelInfo;
 
 typedef struct CodexRpcClient {
     int pid;
@@ -25,12 +32,14 @@ typedef struct CodexRpcClient {
     int initialize_request_id;
     int thread_start_request_id;
     int turn_start_request_id;
+    int model_list_request_id;
 
     char cwd[512];
     char status[CODEX_RPC_MAX_STATUS];
     char thread_id[CODEX_RPC_MAX_THREAD_ID];
     char last_error[CODEX_RPC_MAX_STATUS];
     char transcript[CODEX_RPC_MAX_TRANSCRIPT];
+    char selected_model[CODEX_RPC_MAX_MODEL_ID];
 
     char stdout_buffer[8192];
     size_t stdout_buffer_len;
@@ -39,8 +48,11 @@ typedef struct CodexRpcClient {
     size_t stderr_buffer_len;
     bool stderr_discarding_oversize_line;
 
-    char log_lines[CODEX_RPC_MAX_LOG_LINES][CODEX_RPC_MAX_LOG_LINE];
-    int log_line_count;
+    CodexRpcModelInfo models[CODEX_RPC_MAX_MODELS];
+    int model_count;
+    int selected_model_index;
+    bool models_loading;
+    bool models_loaded;
 } CodexRpcClient;
 
 void CodexRpcClient_Init(CodexRpcClient *client, const char *cwd);
@@ -48,3 +60,5 @@ bool CodexRpcClient_Start(CodexRpcClient *client);
 void CodexRpcClient_Update(CodexRpcClient *client);
 void CodexRpcClient_Stop(CodexRpcClient *client);
 bool CodexRpcClient_SendPrompt(CodexRpcClient *client, const char *prompt);
+bool CodexRpcClient_RequestModelList(CodexRpcClient *client);
+void CodexRpcClient_SelectModel(CodexRpcClient *client, int index);
