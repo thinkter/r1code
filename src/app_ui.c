@@ -167,6 +167,7 @@ int RunApplication(void)
     bool reasoning_dropdown_edit_mode = false;
     int last_model_count = -1;
     int last_reasoning_model_index = -2;
+    bool transcript_auto_follow = true;
 
     SetConfigFlags(FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI | FLAG_WINDOW_RESIZABLE);
     InitWindow(1440, 900, "Codex RPC Wrapper");
@@ -190,7 +191,7 @@ int RunApplication(void)
         int prompt_height = 96;
         int center_height = available_height - prompt_height - gap;
         int content_width = screen_width - (margin * 2);
-        int side_width = 300;
+        int state_width = 300;
         int left_width = 0;
         int right_x = 0;
         int prompt_y = content_top + center_height + gap;
@@ -199,31 +200,31 @@ int RunApplication(void)
         Rectangle header_status = {(float)(margin + 16), (float)(margin + 34), (float)(screen_width - (margin * 2) - 260), 20.0f};
         Rectangle folder_button = {(float)(screen_width - margin - 220), (float)(margin + 16), 200.0f, 30.0f};
         Rectangle transcript_panel = {(float)margin, (float)content_top, (float)left_width, (float)center_height};
-        Rectangle state_panel = {(float)right_x, (float)content_top, (float)side_width, (float)center_height};
+        Rectangle state_panel = {(float)right_x, (float)content_top, (float)state_width, (float)center_height};
         Rectangle prompt_box = {(float)margin, (float)prompt_y, (float)(screen_width - (margin * 2)), (float)prompt_height};
         Rectangle prompt_input = {(float)(margin + 18), (float)(prompt_y + 44), (float)(screen_width - (margin * 2) - 36), 36.0f};
         Rectangle prompt_hint = {(float)(margin + 18), (float)(prompt_y + 18), (float)(screen_width - (margin * 2) - 160), 18.0f};
         Rectangle send_button = {(float)(screen_width - margin - 118), (float)(prompt_y + 14), 100.0f, 26.0f};
 
-        if (content_width < 900) {
-            side_width = 240;
-        } else if (content_width > 1400) {
-            side_width = 320;
+        if (content_width < 1100) {
+            state_width = 240;
+        } else if (content_width > 1600) {
+            state_width = 320;
         }
 
-        if (side_width > content_width - 280) {
-            side_width = content_width - 280;
+        if (state_width > content_width - 280) {
+            state_width = content_width - 280;
         }
 
-        if (side_width < 220) {
-            side_width = 220;
+        if (state_width < 220) {
+            state_width = 220;
         }
 
-        left_width = content_width - gap - side_width;
+        left_width = content_width - gap - state_width;
         right_x = margin + left_width + gap;
         transcript_panel.width = (float)left_width;
         state_panel.x = (float)right_x;
-        state_panel.width = (float)side_width;
+        state_panel.width = (float)state_width;
 
         if (center_height < 180) {
             center_height = 180;
@@ -307,11 +308,13 @@ int RunApplication(void)
         DrawScrollTextPanel(
             ui_font,
             transcript_panel,
-            "Assistant Stream",
+            "Conversation",
             client.transcript[0] != '\0' ? client.transcript : "No streamed assistant output yet. Press Enter to start a turn.",
+            client.transcript_version,
             20.0f,
             &transcript_scroll,
-            center_height - 12
+            center_height - 12,
+            &transcript_auto_follow
         );
 
         GuiPanel(state_panel, "RPC State");

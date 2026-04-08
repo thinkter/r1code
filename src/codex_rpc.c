@@ -20,7 +20,21 @@ typedef enum RequestKind {
     REQUEST_KIND_THREAD_START,
     REQUEST_KIND_TURN_START,
     REQUEST_KIND_MODEL_LIST,
+    REQUEST_KIND_THREAD_READ,
 } RequestKind;
+
+typedef enum TranscriptItemKind {
+    TRANSCRIPT_ITEM_UNKNOWN = 0,
+    TRANSCRIPT_ITEM_AGENT_FINAL,
+    TRANSCRIPT_ITEM_AGENT_COMMENTARY,
+    TRANSCRIPT_ITEM_PLAN,
+    TRANSCRIPT_ITEM_REASONING,
+    TRANSCRIPT_ITEM_COMMAND,
+    TRANSCRIPT_ITEM_FILE_CHANGE,
+    TRANSCRIPT_ITEM_TOOL_CALL,
+} TranscriptItemKind;
+
+static void AppendFileChangeDiffs(CodexRpcClient *client, const char *item_json);
 
 static void CodexRpcClient_SetStatus(CodexRpcClient *client, const char *format, ...)
 {
@@ -270,6 +284,140 @@ static bool JsonExtractArray(const char *json, const char *key, char *output, si
     memcpy(output, start, length);
     output[length] = '\0';
     return true;
+}
+
+static bool JsonExtractObject(const char *json, const char *key, char *output, size_t output_size)
+{
+    char pattern[64];
+    const char *cursor = NULL;
+    const char *start = NULL;
+    const char *end = NULL;
+    int depth = 0;
+    bool in_string = false;
+    bool escaping = false;
+    size_t length = 0;
+
+    if (output_size == 0) {
+        return false;
+    }
+
+    snprintf(pattern, sizeof(pattern), "\"%s\":{", key);
+    cursor = strstr(json, pattern);
+    if (cursor == NULL) {
+        output[0] = '\0';
+        return false;
+    }
+
+    start = strchr(cursor, '{');
+    if (start == NULL) {
+        output[0] = '\0';
+        return false;
+    }
+
+    for (cursor = start; *cursor != '\0'; ++cursor) {
+        char ch = *cursor;
+
+        if (escaping) {
+            escaping = false;
+            continue;
+        }
+
+        if (ch == '\\' && in_string) {
+            escaping = true;
+            continue;
+        }
+
+        if (ch == '"') {
+            in_string = !in_string;
+            continue;
+        }
+
+        if (in_string) {
+            continue;
+        }
+
+        if (ch == '{') {
+            depth += 1;
+        } else if (ch == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                end = cursor + 1;
+                break;
+            }
+        }
+    }
+
+    if (end == NULL) {
+        output[0] = '\0';
+        return false;
+    }
+
+    length = (size_t)(end - start);
+    if (length >= output_size) {
+        length = output_size - 1;
+    }
+
+    memcpy(output, start, length);
+    output[length] = '\0';
+    return true;
+}
+
+static const char *JsonFindNextObject(const char *cursor, const char **object_start, const char **object_end)
+{
+    int depth = 0;
+    bool in_string = false;
+    bool escaping = false;
+
+    if (object_start == NULL || object_end == NULL) {
+        return NULL;
+    }
+
+    *object_start = NULL;
+    *object_end = NULL;
+
+    while (cursor != NULL && *cursor != '\0' && *cursor != '{' && *cursor != ']') {
+        ++cursor;
+    }
+
+    if (cursor == NULL || *cursor != '{') {
+        return NULL;
+    }
+
+    *object_start = cursor;
+    for (; *cursor != '\0'; ++cursor) {
+        char ch = *cursor;
+
+        if (escaping) {
+            escaping = false;
+            continue;
+        }
+
+        if (ch == '\\' && in_string) {
+            escaping = true;
+            continue;
+        }
+
+        if (ch == '"') {
+            in_string = !in_string;
+            continue;
+        }
+
+        if (in_string) {
+            continue;
+        }
+
+        if (ch == '{') {
+            depth += 1;
+        } else if (ch == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                *object_end = cursor + 1;
+                return *object_end;
+            }
+        }
+    }
+
+    return NULL;
 }
 
 static void ResetModelListState(CodexRpcClient *client, bool preserve_selected_model)
@@ -565,16 +713,263 @@ static bool ParseModelListResponse(CodexRpcClient *client, const char *json)
     return parsed > 0;
 }
 
-static void TranscriptAppend(CodexRpcClient *client, const char *text)
+static void AppendWithTruncation(char *buffer, size_t buffer_size, unsigned int *version, const char *text)
 {
-    size_t current_len = strlen(client->transcript);
-    size_t available = sizeof(client->transcript) - current_len - 1;
+    static const char prefix[] = "[... older output trimmed ...]\n";
+    size_t current_len = 0;
+    size_t text_len = 0;
+    size_t keep_len = 0;
 
-    if (available == 0 || text[0] == '\0') {
+    if (buffer == NULL || buffer_size == 0 || version == NULL || text == NULL || text[0] == '\0') {
         return;
     }
 
-    strncat(client->transcript, text, available);
+    current_len = strlen(buffer);
+    text_len = strlen(text);
+
+    if (text_len >= buffer_size) {
+        keep_len = buffer_size - sizeof(prefix);
+        if (keep_len > 1) {
+            memcpy(buffer, prefix, sizeof(prefix) - 1);
+            memcpy(buffer + (sizeof(prefix) - 1), text + (text_len - keep_len), keep_len - 1);
+            buffer[buffer_size - 1] = '\0';
+        } else {
+            buffer[0] = '\0';
+        }
+        *version += 1;
+        return;
+    }
+
+    if (current_len + text_len >= buffer_size) {
+        size_t overflow = (current_len + text_len) - buffer_size + 1;
+        size_t prefix_len = sizeof(prefix) - 1;
+        size_t available = current_len > overflow ? current_len - overflow : 0;
+
+        if (available > buffer_size - prefix_len - 1) {
+            available = buffer_size - prefix_len - 1;
+        }
+
+        memmove(buffer + prefix_len, buffer + (current_len - available), available);
+        memcpy(buffer, prefix, prefix_len);
+        buffer[prefix_len + available] = '\0';
+    }
+
+    strncat(buffer, text, buffer_size - strlen(buffer) - 1);
+    *version += 1;
+}
+
+static void BufferAppendSpacing(char *buffer, size_t buffer_size, unsigned int *version)
+{
+    size_t length = strlen(buffer);
+
+    if (length == 0) {
+        return;
+    }
+
+    if (length >= 2 && buffer[length - 1] == '\n' && buffer[length - 2] == '\n') {
+        return;
+    }
+
+    if (buffer[length - 1] == '\n') {
+        AppendWithTruncation(buffer, buffer_size, version, "\n");
+        return;
+    }
+
+    AppendWithTruncation(buffer, buffer_size, version, "\n\n");
+}
+
+static void TranscriptAppend(CodexRpcClient *client, const char *text)
+{
+    AppendWithTruncation(client->transcript, sizeof(client->transcript), &client->transcript_version, text);
+}
+
+static void TranscriptAppendSpacing(CodexRpcClient *client)
+{
+    BufferAppendSpacing(client->transcript, sizeof(client->transcript), &client->transcript_version);
+}
+
+static void PlanAppend(CodexRpcClient *client, const char *text)
+{
+    AppendWithTruncation(client->plan_text, sizeof(client->plan_text), &client->plan_version, text);
+}
+
+static void PlanAppendSpacing(CodexRpcClient *client)
+{
+    BufferAppendSpacing(client->plan_text, sizeof(client->plan_text), &client->plan_version);
+}
+
+static void ActivityAppend(CodexRpcClient *client, const char *text)
+{
+    AppendWithTruncation(client->activity_text, sizeof(client->activity_text), &client->activity_version, text);
+}
+
+static void ActivityAppendSpacing(CodexRpcClient *client)
+{
+    BufferAppendSpacing(client->activity_text, sizeof(client->activity_text), &client->activity_version);
+}
+
+static void DiffAppend(CodexRpcClient *client, const char *text)
+{
+    AppendWithTruncation(client->diff_text, sizeof(client->diff_text), &client->diff_version, text);
+}
+
+static void ReplaceBuffer(char *buffer, size_t buffer_size, unsigned int *version, const char *text)
+{
+    if (buffer == NULL || buffer_size == 0 || version == NULL) {
+        return;
+    }
+
+    if (text == NULL) {
+        buffer[0] = '\0';
+    } else {
+        snprintf(buffer, buffer_size, "%s", text);
+    }
+    *version += 1;
+}
+
+static void ClearBuffer(char *buffer, unsigned int *version)
+{
+    if (buffer == NULL || version == NULL) {
+        return;
+    }
+
+    buffer[0] = '\0';
+    *version += 1;
+}
+
+static const char *TranscriptItemLabel(TranscriptItemKind kind)
+{
+    switch (kind) {
+        case TRANSCRIPT_ITEM_AGENT_FINAL:
+            return "Codex: ";
+        case TRANSCRIPT_ITEM_AGENT_COMMENTARY:
+            return "[Commentary] ";
+        case TRANSCRIPT_ITEM_PLAN:
+            return "[Plan] ";
+        case TRANSCRIPT_ITEM_REASONING:
+            return "[Reasoning] ";
+        case TRANSCRIPT_ITEM_COMMAND:
+            return "[Command] ";
+        case TRANSCRIPT_ITEM_FILE_CHANGE:
+            return "[Code Update]\n";
+        case TRANSCRIPT_ITEM_TOOL_CALL:
+            return "[Tool]\n";
+        case TRANSCRIPT_ITEM_UNKNOWN:
+        default:
+            return "";
+    }
+}
+
+static bool TranscriptItemUsesTranscript(TranscriptItemKind kind)
+{
+    return kind == TRANSCRIPT_ITEM_AGENT_FINAL || kind == TRANSCRIPT_ITEM_AGENT_COMMENTARY;
+}
+
+static bool TranscriptItemUsesPlan(TranscriptItemKind kind)
+{
+    return kind == TRANSCRIPT_ITEM_PLAN;
+}
+
+static bool TranscriptItemUsesActivity(TranscriptItemKind kind)
+{
+    return kind == TRANSCRIPT_ITEM_REASONING ||
+           kind == TRANSCRIPT_ITEM_COMMAND ||
+           kind == TRANSCRIPT_ITEM_FILE_CHANGE ||
+           kind == TRANSCRIPT_ITEM_TOOL_CALL;
+}
+
+static void AppendDiffSnapshotToTranscript(CodexRpcClient *client)
+{
+    if (client->diff_text[0] == '\0') {
+        return;
+    }
+
+    TranscriptAppendSpacing(client);
+    TranscriptAppend(client, "[Diff]\n");
+    TranscriptAppend(client, client->diff_text);
+    ClearBuffer(client->diff_text, &client->diff_version);
+}
+
+static void ResetActiveItems(CodexRpcClient *client)
+{
+    memset(client->active_item_ids, 0, sizeof(client->active_item_ids));
+    memset(client->active_item_kinds, 0, sizeof(client->active_item_kinds));
+    memset(client->active_item_opened, 0, sizeof(client->active_item_opened));
+    client->active_item_count = 0;
+}
+
+static int FindActiveItemIndex(const CodexRpcClient *client, const char *item_id)
+{
+    if (item_id == NULL || item_id[0] == '\0') {
+        return -1;
+    }
+
+    for (int i = 0; i < client->active_item_count; ++i) {
+        if (strcmp(client->active_item_ids[i], item_id) == 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static int EnsureActiveItemIndex(CodexRpcClient *client, const char *item_id, TranscriptItemKind kind)
+{
+    int index = FindActiveItemIndex(client, item_id);
+
+    if (index >= 0) {
+        if (kind != TRANSCRIPT_ITEM_UNKNOWN) {
+            client->active_item_kinds[index] = (int)kind;
+        }
+        return index;
+    }
+
+    if (item_id == NULL || item_id[0] == '\0') {
+        return -1;
+    }
+
+    if (client->active_item_count >= CODEX_RPC_MAX_ACTIVE_ITEMS) {
+        return -1;
+    }
+
+    index = client->active_item_count++;
+    snprintf(client->active_item_ids[index], sizeof(client->active_item_ids[index]), "%s", item_id);
+    client->active_item_kinds[index] = (int)kind;
+    client->active_item_opened[index] = false;
+    return index;
+}
+
+static void TranscriptOpenItemIfNeeded(CodexRpcClient *client, const char *item_id, TranscriptItemKind fallback_kind)
+{
+    int index = EnsureActiveItemIndex(client, item_id, fallback_kind);
+    TranscriptItemKind kind = fallback_kind;
+
+    if (index >= 0) {
+        kind = (TranscriptItemKind)client->active_item_kinds[index];
+        if (kind == TRANSCRIPT_ITEM_UNKNOWN) {
+            kind = fallback_kind;
+            client->active_item_kinds[index] = (int)kind;
+        }
+
+        if (client->active_item_opened[index]) {
+            return;
+        }
+    }
+
+    if (TranscriptItemUsesTranscript(kind)) {
+        TranscriptAppendSpacing(client);
+        TranscriptAppend(client, TranscriptItemLabel(kind));
+    } else if (TranscriptItemUsesPlan(kind)) {
+        PlanAppendSpacing(client);
+        PlanAppend(client, TranscriptItemLabel(kind));
+    } else if (TranscriptItemUsesActivity(kind)) {
+        TranscriptAppendSpacing(client);
+        TranscriptAppend(client, TranscriptItemLabel(kind));
+    }
+
+    if (index >= 0) {
+        client->active_item_opened[index] = true;
+    }
 }
 
 static void TranscriptAppendTurnEnvelope(CodexRpcClient *client, const char *prompt)
@@ -586,6 +981,622 @@ static void TranscriptAppendTurnEnvelope(CodexRpcClient *client, const char *pro
     TranscriptAppend(client, "You: ");
     TranscriptAppend(client, prompt);
     TranscriptAppend(client, "\nCodex: ");
+
+    PlanAppendSpacing(client);
+    PlanAppend(client, "Turn: ");
+    PlanAppend(client, prompt);
+    PlanAppend(client, "\n");
+
+    ActivityAppendSpacing(client);
+    ActivityAppend(client, "Turn: ");
+    ActivityAppend(client, prompt);
+    ActivityAppend(client, "\n");
+
+    DiffAppend(client, "\n\n");
+    DiffAppend(client, "--- Turn ---\n");
+    DiffAppend(client, prompt);
+    DiffAppend(client, "\n");
+}
+
+static TranscriptItemKind ParseThreadItemKind(const char *item_json)
+{
+    char item_type[64];
+    char phase[32];
+
+    item_type[0] = '\0';
+    phase[0] = '\0';
+
+    if (!JsonExtractString(item_json, "type", item_type, sizeof(item_type))) {
+        return TRANSCRIPT_ITEM_UNKNOWN;
+    }
+
+    if (strcmp(item_type, "agentMessage") == 0) {
+        if (JsonExtractString(item_json, "phase", phase, sizeof(phase)) && strcmp(phase, "commentary") == 0) {
+            return TRANSCRIPT_ITEM_AGENT_COMMENTARY;
+        }
+        return TRANSCRIPT_ITEM_AGENT_FINAL;
+    }
+
+    if (strcmp(item_type, "plan") == 0) {
+        return TRANSCRIPT_ITEM_PLAN;
+    }
+
+    if (strcmp(item_type, "reasoning") == 0) {
+        return TRANSCRIPT_ITEM_REASONING;
+    }
+
+    if (strcmp(item_type, "commandExecution") == 0) {
+        return TRANSCRIPT_ITEM_COMMAND;
+    }
+
+    if (strcmp(item_type, "fileChange") == 0) {
+        return TRANSCRIPT_ITEM_FILE_CHANGE;
+    }
+
+    if (strcmp(item_type, "mcpToolCall") == 0 || strcmp(item_type, "dynamicToolCall") == 0 || strcmp(item_type, "collabAgentToolCall") == 0) {
+        return TRANSCRIPT_ITEM_TOOL_CALL;
+    }
+
+    return TRANSCRIPT_ITEM_UNKNOWN;
+}
+
+static void TrackThreadItem(CodexRpcClient *client, const char *line)
+{
+    char item_json[32768];
+    char item_id[CODEX_RPC_MAX_ITEM_ID];
+    char command[1024];
+    TranscriptItemKind kind = TRANSCRIPT_ITEM_UNKNOWN;
+    int index = -1;
+
+    item_json[0] = '\0';
+    item_id[0] = '\0';
+    command[0] = '\0';
+
+    if (!JsonExtractObject(line, "item", item_json, sizeof(item_json))) {
+        return;
+    }
+
+    if (!JsonExtractString(item_json, "id", item_id, sizeof(item_id))) {
+        return;
+    }
+
+    kind = ParseThreadItemKind(item_json);
+    index = EnsureActiveItemIndex(client, item_id, kind);
+    if (index < 0) {
+        return;
+    }
+
+    if (kind == TRANSCRIPT_ITEM_COMMAND && JsonExtractString(item_json, "command", command, sizeof(command))) {
+        TranscriptOpenItemIfNeeded(client, item_id, kind);
+        TranscriptAppend(client, command);
+        TranscriptAppend(client, "\n");
+    }
+}
+
+static void AppendCompletedThreadItem(CodexRpcClient *client, const char *line)
+{
+    char item_json[65536];
+    char item_id[CODEX_RPC_MAX_ITEM_ID];
+    char text[16384];
+    TranscriptItemKind kind = TRANSCRIPT_ITEM_UNKNOWN;
+    int index = -1;
+
+    item_json[0] = '\0';
+    item_id[0] = '\0';
+    text[0] = '\0';
+
+    if (!JsonExtractObject(line, "item", item_json, sizeof(item_json))) {
+        return;
+    }
+
+    if (!JsonExtractString(item_json, "id", item_id, sizeof(item_id))) {
+        return;
+    }
+
+    kind = ParseThreadItemKind(item_json);
+    index = EnsureActiveItemIndex(client, item_id, kind);
+    if (index < 0) {
+        return;
+    }
+
+    if (kind == TRANSCRIPT_ITEM_AGENT_FINAL || kind == TRANSCRIPT_ITEM_AGENT_COMMENTARY || kind == TRANSCRIPT_ITEM_PLAN) {
+        if (client->active_item_opened[index]) {
+            return;
+        }
+        if (JsonExtractString(item_json, "text", text, sizeof(text)) && text[0] != '\0') {
+            TranscriptOpenItemIfNeeded(client, item_id, kind);
+            if (TranscriptItemUsesTranscript(kind)) {
+                TranscriptAppend(client, text);
+            } else if (TranscriptItemUsesPlan(kind)) {
+                PlanAppend(client, text);
+            }
+        }
+        return;
+    }
+
+    if (kind == TRANSCRIPT_ITEM_COMMAND) {
+        if (JsonExtractString(item_json, "aggregatedOutput", text, sizeof(text)) && text[0] != '\0') {
+            TranscriptOpenItemIfNeeded(client, item_id, kind);
+            if (client->transcript[0] != '\0' && client->transcript[strlen(client->transcript) - 1] != '\n') {
+                TranscriptAppend(client, "\n");
+            }
+            TranscriptAppend(client, text);
+            TranscriptAppend(client, "\n");
+        }
+        return;
+    }
+
+    if (kind == TRANSCRIPT_ITEM_FILE_CHANGE) {
+        AppendFileChangeDiffs(client, item_json);
+    }
+}
+
+static void AppendDeltaForItem(CodexRpcClient *client, const char *line, TranscriptItemKind fallback_kind, const char *delta_key)
+{
+    char item_id[CODEX_RPC_MAX_ITEM_ID];
+    char delta[2048];
+
+    item_id[0] = '\0';
+    delta[0] = '\0';
+
+    if (!JsonExtractString(line, "itemId", item_id, sizeof(item_id))) {
+        return;
+    }
+
+    if (!JsonExtractString(line, delta_key, delta, sizeof(delta)) || delta[0] == '\0') {
+        return;
+    }
+
+    TranscriptOpenItemIfNeeded(client, item_id, fallback_kind);
+    if (TranscriptItemUsesTranscript(fallback_kind)) {
+        TranscriptAppend(client, delta);
+    } else if (TranscriptItemUsesPlan(fallback_kind)) {
+        PlanAppend(client, delta);
+    } else if (TranscriptItemUsesActivity(fallback_kind)) {
+        TranscriptAppend(client, delta);
+    }
+}
+
+static void RenderStructuredPlan(CodexRpcClient *client, const char *line)
+{
+    char explanation[1024];
+    char plan_json[4096];
+    char rendered[8192];
+    const char *cursor = NULL;
+    size_t out = 0;
+
+    explanation[0] = '\0';
+    plan_json[0] = '\0';
+    rendered[0] = '\0';
+
+    JsonExtractString(line, "explanation", explanation, sizeof(explanation));
+    JsonExtractArray(line, "plan", plan_json, sizeof(plan_json));
+
+    if (explanation[0] != '\0') {
+        out += (size_t)snprintf(rendered + out, sizeof(rendered) - out, "%s\n\n", explanation);
+    }
+
+    cursor = plan_json;
+    while (cursor != NULL && *cursor != '\0' && *cursor != ']' && out + 4 < sizeof(rendered)) {
+        const char *object_start = strchr(cursor, '{');
+        const char *object_end = NULL;
+        int depth = 0;
+        bool in_string = false;
+        bool escaping = false;
+        char object_json[512];
+        char step[256];
+        char status[32];
+        size_t object_length = 0;
+
+        if (object_start == NULL) {
+            break;
+        }
+
+        for (cursor = object_start; *cursor != '\0'; ++cursor) {
+            char ch = *cursor;
+
+            if (escaping) {
+                escaping = false;
+                continue;
+            }
+            if (ch == '\\' && in_string) {
+                escaping = true;
+                continue;
+            }
+            if (ch == '"') {
+                in_string = !in_string;
+                continue;
+            }
+            if (in_string) {
+                continue;
+            }
+            if (ch == '{') {
+                depth += 1;
+            } else if (ch == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    object_end = cursor + 1;
+                    break;
+                }
+            }
+        }
+
+        if (object_end == NULL) {
+            break;
+        }
+
+        object_length = (size_t)(object_end - object_start);
+        if (object_length >= sizeof(object_json)) {
+            object_length = sizeof(object_json) - 1;
+        }
+
+        memcpy(object_json, object_start, object_length);
+        object_json[object_length] = '\0';
+
+        step[0] = '\0';
+        status[0] = '\0';
+        JsonExtractString(object_json, "step", step, sizeof(step));
+        JsonExtractString(object_json, "status", status, sizeof(status));
+
+        if (step[0] != '\0') {
+            out += (size_t)snprintf(rendered + out, sizeof(rendered) - out, "- [%s] %s\n", status[0] != '\0' ? status : "pending", step);
+        }
+
+        cursor = object_end;
+    }
+
+    if (rendered[0] != '\0') {
+        ReplaceBuffer(client->plan_text, sizeof(client->plan_text), &client->plan_version, rendered);
+    }
+}
+
+static void TranscriptAppendDiffLine(CodexRpcClient *client, int old_line, int new_line, char prefix, const char *text)
+{
+    char line_prefix[64];
+
+    if (old_line > 0 && new_line > 0) {
+        snprintf(line_prefix, sizeof(line_prefix), "%5d %5d %c ", old_line, new_line, prefix);
+    } else if (old_line > 0) {
+        snprintf(line_prefix, sizeof(line_prefix), "%5d %5s %c ", old_line, "", prefix);
+    } else if (new_line > 0) {
+        snprintf(line_prefix, sizeof(line_prefix), "%5s %5d %c ", "", new_line, prefix);
+    } else {
+        snprintf(line_prefix, sizeof(line_prefix), "%5s %5s %c ", "", "", prefix);
+    }
+
+    TranscriptAppend(client, line_prefix);
+    TranscriptAppend(client, text);
+    TranscriptAppend(client, "\n");
+}
+
+static void TranscriptAppendFormattedDiff(CodexRpcClient *client, const char *path, const char *diff)
+{
+    const char *cursor = diff;
+    int old_line = 0;
+    int new_line = 0;
+    bool in_hunk = false;
+
+    if (path != NULL && path[0] != '\0') {
+        TranscriptAppendSpacing(client);
+        TranscriptAppend(client, "[Code Update] ");
+        TranscriptAppend(client, path);
+        TranscriptAppend(client, "\n");
+    }
+
+    while (cursor != NULL && *cursor != '\0') {
+        const char *line_end = strchr(cursor, '\n');
+        size_t line_length = line_end != NULL ? (size_t)(line_end - cursor) : strlen(cursor);
+        char line[32768];
+
+        if (line_length >= sizeof(line)) {
+            line_length = sizeof(line) - 1;
+        }
+
+        memcpy(line, cursor, line_length);
+        line[line_length] = '\0';
+
+        if (strncmp(line, "@@ ", 3) == 0 || strncmp(line, "@@", 2) == 0) {
+            const char *minus = strchr(line, '-');
+            const char *plus = strchr(line, '+');
+
+            if (minus != NULL) {
+                old_line = (int)strtol(minus + 1, NULL, 10);
+            }
+            if (plus != NULL) {
+                new_line = (int)strtol(plus + 1, NULL, 10);
+            }
+            in_hunk = true;
+            TranscriptAppend(client, "      old   new   ");
+            TranscriptAppend(client, line);
+            TranscriptAppend(client, "\n");
+        } else if (in_hunk && (line[0] == ' ' || line[0] == '+' || line[0] == '-')) {
+            if (line[0] == ' ') {
+                TranscriptAppendDiffLine(client, old_line, new_line, ' ', line + 1);
+                old_line += 1;
+                new_line += 1;
+            } else if (line[0] == '-') {
+                TranscriptAppendDiffLine(client, old_line, 0, '-', line + 1);
+                old_line += 1;
+            } else if (line[0] == '+') {
+                TranscriptAppendDiffLine(client, 0, new_line, '+', line + 1);
+                new_line += 1;
+            }
+        } else {
+            TranscriptAppend(client, line);
+            TranscriptAppend(client, "\n");
+        }
+
+        cursor = line_end != NULL ? line_end + 1 : NULL;
+    }
+}
+
+static void RenderThreadItemToTranscript(CodexRpcClient *client, const char *item_json)
+{
+    char item_type[64];
+
+    item_type[0] = '\0';
+    if (!JsonExtractString(item_json, "type", item_type, sizeof(item_type))) {
+        return;
+    }
+
+    if (strcmp(item_type, "userMessage") == 0) {
+        char content_json[32768];
+        const char *cursor = NULL;
+        bool wrote_header = false;
+
+        content_json[0] = '\0';
+        if (!JsonExtractArray(item_json, "content", content_json, sizeof(content_json))) {
+            return;
+        }
+
+        cursor = content_json;
+        while (cursor != NULL && *cursor != '\0') {
+            const char *object_start = NULL;
+            const char *object_end = NULL;
+            char input_json[8192];
+            char type[32];
+            char text[4096];
+            size_t object_length = 0;
+
+            cursor = JsonFindNextObject(cursor, &object_start, &object_end);
+            if (cursor == NULL || object_start == NULL || object_end == NULL) {
+                break;
+            }
+
+            object_length = (size_t)(object_end - object_start);
+            if (object_length >= sizeof(input_json)) {
+                object_length = sizeof(input_json) - 1;
+            }
+            memcpy(input_json, object_start, object_length);
+            input_json[object_length] = '\0';
+
+            type[0] = '\0';
+            text[0] = '\0';
+            JsonExtractString(input_json, "type", type, sizeof(type));
+            JsonExtractString(input_json, "text", text, sizeof(text));
+
+            if (strcmp(type, "text") == 0 && text[0] != '\0') {
+                if (client->transcript[0] != '\0') {
+                    TranscriptAppend(client, "\n\n");
+                }
+                TranscriptAppend(client, "You: ");
+                TranscriptAppend(client, text);
+                TranscriptAppend(client, "\n");
+                wrote_header = true;
+                break;
+            }
+        }
+
+        if (!wrote_header) {
+            return;
+        }
+        return;
+    }
+
+    if (strcmp(item_type, "agentMessage") == 0) {
+        char text[16384];
+        char phase[32];
+
+        text[0] = '\0';
+        phase[0] = '\0';
+        JsonExtractString(item_json, "text", text, sizeof(text));
+        JsonExtractString(item_json, "phase", phase, sizeof(phase));
+        if (text[0] == '\0') {
+            return;
+        }
+
+        TranscriptAppendSpacing(client);
+        if (strcmp(phase, "commentary") == 0) {
+            TranscriptAppend(client, "[Commentary] ");
+        } else {
+            TranscriptAppend(client, "Codex: ");
+        }
+        TranscriptAppend(client, text);
+        return;
+    }
+
+    if (strcmp(item_type, "commandExecution") == 0) {
+        char command[2048];
+        char output[32768];
+
+        command[0] = '\0';
+        output[0] = '\0';
+        JsonExtractString(item_json, "command", command, sizeof(command));
+        JsonExtractString(item_json, "aggregatedOutput", output, sizeof(output));
+
+        if (command[0] != '\0') {
+            TranscriptAppendSpacing(client);
+            TranscriptAppend(client, "[Command] ");
+            TranscriptAppend(client, command);
+            TranscriptAppend(client, "\n");
+        }
+
+        if (output[0] != '\0') {
+            TranscriptAppend(client, output);
+            TranscriptAppend(client, "\n");
+        }
+        return;
+    }
+
+    if (strcmp(item_type, "fileChange") == 0) {
+        AppendFileChangeDiffs(client, item_json);
+    }
+}
+
+static bool RebuildTranscriptFromThreadReadResponse(CodexRpcClient *client, const char *line)
+{
+    char thread_json[262144];
+    char turns_json[262144];
+    const char *turn_cursor = NULL;
+
+    thread_json[0] = '\0';
+    turns_json[0] = '\0';
+
+    if (!JsonExtractObject(line, "thread", thread_json, sizeof(thread_json))) {
+        return false;
+    }
+
+    if (!JsonExtractArray(thread_json, "turns", turns_json, sizeof(turns_json))) {
+        return false;
+    }
+
+    ClearBuffer(client->transcript, &client->transcript_version);
+    turn_cursor = turns_json;
+
+    while (turn_cursor != NULL && *turn_cursor != '\0') {
+        const char *turn_start = NULL;
+        const char *turn_end = NULL;
+        char turn_json[65536];
+        char items_json[65536];
+        const char *item_cursor = NULL;
+        size_t turn_length = 0;
+
+        turn_cursor = JsonFindNextObject(turn_cursor, &turn_start, &turn_end);
+        if (turn_cursor == NULL || turn_start == NULL || turn_end == NULL) {
+            break;
+        }
+
+        turn_length = (size_t)(turn_end - turn_start);
+        if (turn_length >= sizeof(turn_json)) {
+            turn_length = sizeof(turn_json) - 1;
+        }
+        memcpy(turn_json, turn_start, turn_length);
+        turn_json[turn_length] = '\0';
+
+        items_json[0] = '\0';
+        if (!JsonExtractArray(turn_json, "items", items_json, sizeof(items_json))) {
+            continue;
+        }
+
+        item_cursor = items_json;
+        while (item_cursor != NULL && *item_cursor != '\0') {
+            const char *item_start = NULL;
+            const char *item_end = NULL;
+            char item_json[65536];
+            size_t item_length = 0;
+
+            item_cursor = JsonFindNextObject(item_cursor, &item_start, &item_end);
+            if (item_cursor == NULL || item_start == NULL || item_end == NULL) {
+                break;
+            }
+
+            item_length = (size_t)(item_end - item_start);
+            if (item_length >= sizeof(item_json)) {
+                item_length = sizeof(item_json) - 1;
+            }
+            memcpy(item_json, item_start, item_length);
+            item_json[item_length] = '\0';
+
+            RenderThreadItemToTranscript(client, item_json);
+        }
+    }
+
+    return true;
+}
+
+static void AppendFileChangeDiffs(CodexRpcClient *client, const char *item_json)
+{
+    char changes_json[65536];
+    const char *cursor = NULL;
+
+    changes_json[0] = '\0';
+    if (!JsonExtractArray(item_json, "changes", changes_json, sizeof(changes_json))) {
+        return;
+    }
+
+    cursor = changes_json;
+    while (cursor != NULL && *cursor != '\0' && *cursor != ']') {
+        const char *object_start = strchr(cursor, '{');
+        const char *object_end = NULL;
+        int depth = 0;
+        bool in_string = false;
+        bool escaping = false;
+        char change_json[32768];
+        char path[512];
+        char diff[32768];
+        size_t object_length = 0;
+
+        if (object_start == NULL) {
+            break;
+        }
+
+        for (cursor = object_start; *cursor != '\0'; ++cursor) {
+            char ch = *cursor;
+
+            if (escaping) {
+                escaping = false;
+                continue;
+            }
+            if (ch == '\\' && in_string) {
+                escaping = true;
+                continue;
+            }
+            if (ch == '"') {
+                in_string = !in_string;
+                continue;
+            }
+            if (in_string) {
+                continue;
+            }
+            if (ch == '{') {
+                depth += 1;
+            } else if (ch == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    object_end = cursor + 1;
+                    break;
+                }
+            }
+        }
+
+        if (object_end == NULL) {
+            break;
+        }
+
+        object_length = (size_t)(object_end - object_start);
+        if (object_length >= sizeof(change_json)) {
+            object_length = sizeof(change_json) - 1;
+        }
+
+        memcpy(change_json, object_start, object_length);
+        change_json[object_length] = '\0';
+
+        path[0] = '\0';
+        diff[0] = '\0';
+        JsonExtractString(change_json, "path", path, sizeof(path));
+        JsonExtractString(change_json, "diff", diff, sizeof(diff));
+
+        if (diff[0] != '\0') {
+            TranscriptAppendFormattedDiff(client, path, diff);
+        } else if (path[0] != '\0') {
+            TranscriptAppendSpacing(client);
+            TranscriptAppend(client, "[Code Update] ");
+            TranscriptAppend(client, path);
+            TranscriptAppend(client, "\n");
+        }
+
+        cursor = object_end;
+    }
 }
 
 static void CodexRpcClient_CloseFds(CodexRpcClient *client)
@@ -613,6 +1624,7 @@ static void CodexRpcClient_ResetRuntimeState(CodexRpcClient *client)
     client->thread_ready = false;
     client->turn_in_flight = false;
     client->pid = -1;
+    ResetActiveItems(client);
 }
 
 static void ClosePipePair(int pipefd[2])
@@ -691,6 +1703,10 @@ static RequestKind CodexRpcClient_GetRequestKind(const CodexRpcClient *client, i
         return REQUEST_KIND_MODEL_LIST;
     }
 
+    if (request_id == client->thread_read_request_id) {
+        return REQUEST_KIND_THREAD_READ;
+    }
+
     return REQUEST_KIND_UNKNOWN;
 }
 
@@ -750,6 +1766,29 @@ static bool CodexRpcClient_SendThreadStart(CodexRpcClient *client)
     );
 
     CodexRpcClient_SetStatus(client, "Creating thread...");
+    return CodexRpcClient_SendRaw(client, payload);
+}
+
+static bool CodexRpcClient_RequestThreadRead(CodexRpcClient *client)
+{
+    char payload[256];
+    int request_id = 0;
+
+    if (!client->running || !client->initialized || client->thread_id[0] == '\0') {
+        return false;
+    }
+
+    request_id = client->next_request_id++;
+    client->thread_read_request_id = request_id;
+
+    snprintf(
+        payload,
+        sizeof(payload),
+        "{\"id\":%d,\"method\":\"thread/read\",\"params\":{\"threadId\":\"%s\",\"includeTurns\":true}}",
+        request_id,
+        client->thread_id
+    );
+
     return CodexRpcClient_SendRaw(client, payload);
 }
 
@@ -824,6 +1863,7 @@ bool CodexRpcClient_SendPrompt(CodexRpcClient *client, const char *prompt)
     request_id = client->next_request_id++;
     client->turn_start_request_id = request_id;
     client->turn_in_flight = true;
+    ResetActiveItems(client);
 
     snprintf(
         payload,
@@ -934,6 +1974,14 @@ static void CodexRpcClient_HandleResponse(CodexRpcClient *client, const char *li
             }
             break;
 
+        case REQUEST_KIND_THREAD_READ:
+            if (RebuildTranscriptFromThreadReadResponse(client, line)) {
+                CodexRpcClient_SetStatus(client, "Thread history synced");
+            } else {
+                CodexRpcClient_SetStatus(client, "Thread history unavailable");
+            }
+            break;
+
         case REQUEST_KIND_UNKNOWN:
         default:
             break;
@@ -960,21 +2008,71 @@ static void CodexRpcClient_HandleNotification(CodexRpcClient *client, const char
     if (strcmp(method, "turn/started") == 0) {
         client->turn_in_flight = true;
         CodexRpcClient_SetStatus(client, "Turn streaming...");
+        ResetActiveItems(client);
         return;
     }
 
     if (strcmp(method, "turn/completed") == 0) {
         client->turn_in_flight = false;
         CodexRpcClient_SetStatus(client, "Turn completed");
+        CodexRpcClient_RequestThreadRead(client);
+        return;
+    }
+
+    if (strcmp(method, "item/started") == 0) {
+        TrackThreadItem(client, line);
+        return;
+    }
+
+    if (strcmp(method, "item/completed") == 0) {
+        AppendCompletedThreadItem(client, line);
         return;
     }
 
     if (strcmp(method, "item/agentMessage/delta") == 0) {
-        char delta[1024];
+        AppendDeltaForItem(client, line, TRANSCRIPT_ITEM_AGENT_FINAL, "delta");
+        return;
+    }
 
-        if (JsonExtractString(line, "delta", delta, sizeof(delta))) {
-            TranscriptAppend(client, delta);
+    if (strcmp(method, "item/plan/delta") == 0) {
+        AppendDeltaForItem(client, line, TRANSCRIPT_ITEM_PLAN, "delta");
+        return;
+    }
+
+    if (strcmp(method, "item/reasoning/summaryTextDelta") == 0 || strcmp(method, "item/reasoning/textDelta") == 0) {
+        AppendDeltaForItem(client, line, TRANSCRIPT_ITEM_REASONING, "delta");
+        return;
+    }
+
+    if (strcmp(method, "item/commandExecution/outputDelta") == 0) {
+        AppendDeltaForItem(client, line, TRANSCRIPT_ITEM_COMMAND, "delta");
+        return;
+    }
+
+    if (strcmp(method, "item/fileChange/outputDelta") == 0) {
+        AppendDeltaForItem(client, line, TRANSCRIPT_ITEM_FILE_CHANGE, "delta");
+        return;
+    }
+
+    if (strcmp(method, "item/mcpToolCall/progress") == 0) {
+        AppendDeltaForItem(client, line, TRANSCRIPT_ITEM_TOOL_CALL, "message");
+        return;
+    }
+
+    if (strcmp(method, "turn/plan/updated") == 0) {
+        RenderStructuredPlan(client, line);
+        CodexRpcClient_SetStatus(client, "Plan updated");
+        return;
+    }
+
+    if (strcmp(method, "turn/diff/updated") == 0) {
+        char diff[CODEX_RPC_MAX_DIFF_TEXT];
+
+        diff[0] = '\0';
+        if (JsonExtractString(line, "diff", diff, sizeof(diff))) {
+            ReplaceBuffer(client->diff_text, sizeof(client->diff_text), &client->diff_version, diff);
         }
+        CodexRpcClient_SetStatus(client, "Code diff updated");
         return;
     }
 
